@@ -16,7 +16,10 @@ window.__ModuleLoader__.load({
       verifyHost: ['Verify host key', '核验主机指纹'],
       lastKnown: ['Last known active', '上次确认时生效'],
       edit: ['Edit', '编辑'], cancel: ['Cancel', '取消'], editDevice: ['Edit device', '编辑设备'],
-      hostKey: ['Host identity', '主机身份'], hostKeyHelp: ['Get the SHA256 fingerprint from a trusted console for this device.', '请从可信控制台获取此设备的 SHA256 指纹。'],
+      hostKey: ['Host identity', '主机身份'], hostKeyHelp: ['Run this command on the target server using a trusted console, such as your cloud console.', '请在目标服务器的可信控制台执行下面的命令，例如云厂商提供的控制台。'],
+      hostKeyPaste: ['Paste the part starting with SHA256:. If the SSH server uses another host key, use its .pub file in the command.', '把输出中以 SHA256: 开头的那一段填到上方。如果 SSH 服务使用另一把主机密钥，请将命令中的路径换成对应的公钥文件。'],
+      copyCommand: ['Copy command', '复制命令'], copiedCommand: ['Command copied', '命令已复制'],
+      copyCommandFailed: ['Clipboard unavailable. Select the command and copy it manually.', '无法写入剪贴板，请选中命令手动复制。'],
       backupTools: ['Backup and restore', '备份与恢复'], restoreUnavailable: ['Restoring a backup requires an empty, unlocked vault.', '恢复备份需要一个已解锁的空凭据库。'],
       newGrant: ['Grant access to a conversation', '为会话授权'], noVerifiedDevices: ['Add a device and verify its host key to grant access.', '请先添加设备并核验主机指纹。'],
       noSessions: ['Open a conversation before granting access.', '请先打开一个会话，再授予权限。'],
@@ -29,7 +32,14 @@ window.__ModuleLoader__.load({
       migrate: ['Migrate legacy device', '迁移旧设备'], cleanup: ['Retry legacy cleanup', '重试清理旧记录'], legacy: ['Legacy device', '旧版设备'],
       confirmLegacy: ['Move the matching credential into the vault and remove the old local record.', '将匹配的凭据迁入加密库，并移除本地旧记录。'],
       session: ['Harness conversation', 'Harness 会话'], choose: ['Select conversation', '选择会话'], ttl: ['Duration (seconds)', '有效期（秒）'],
+      duration: ['Authorization duration', '授权时限'], timed: ['For a fixed time', '限时有效'], sessionDuration: ['For this conversation', '本次会话有效'],
+      reviewSessionGrant: ['Review authorization', '核对会话授权'], confirmSessionGrant: ['Confirm conversation access', '确认会话授权'],
+      sessionGrantHelp: ['The vault stays unlocked while any authorization set to “For this conversation” is active. Closing the browser tab can leave access active.', '只要还有「本次会话有效」的授权生效，凭据库就会暂停空闲上锁。关闭浏览器标签页后，授权可能仍然有效。'],
+      sessionGrantEnd: ['Ending the conversation, restarting Harness, revoking access, or locking the vault ends this authorization.', '会话关闭、Harness 退出或重启、手动撤销或锁定凭据库都会使授权失效。'],
+      sessionGrantChanged: ['The device or conversation changed. Go back and review your selection.', '设备或会话已变更，请返回重新核对。'],
+      back: ['Back to edit', '返回修改'],
       confirmGrant: ['Grant the selected access to this conversation and device.', '将所选权限授予此会话，仅限所选设备。'],
+      vaultIdlePaused: ['A “For this conversation” authorization is active. Idle locking is paused.', '有「本次会话有效」的授权生效，凭据库已暂停空闲上锁。'],
       grantMode: ['Allowed operations', '允许的操作'], shellOnly: ['Shell only (file transfer off)', '仅 Shell（文件传输关闭）'],
       transferOnly: ['File transfer only', '仅文件传输'], shellAndTransfer: ['Shell and file transfer', 'Shell 和文件传输'],
       transferDirectory: ['Remote directory', '远端目录'],
@@ -75,6 +85,7 @@ window.__ModuleLoader__.load({
         display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px;
       }
       .dsw-ssh-panel :is(.ssh-stack, .ssh-list, .ssh-field, .ssh-grid) { display: grid; min-width: 0; gap: 12px; }
+      .dsw-ssh-panel .ssh-stack[hidden] { display: none; }
       .dsw-ssh-panel .ssh-list { list-style: none; padding: 0; gap: 8px; }
       .dsw-ssh-panel .ssh-group { display: grid; gap: 8px; min-width: 0; }
       .dsw-ssh-panel .ssh-card { border: 1px solid var(--dsw-alias-border-l1); border-radius: 14px; padding: 14px; min-width: 0; }
@@ -90,6 +101,14 @@ window.__ModuleLoader__.load({
       }
       .dsw-ssh-panel textarea.ssh-control { resize: vertical; }
       .dsw-ssh-panel .ssh-mono { font-family: ui-monospace, monospace; }
+      .dsw-ssh-panel .ssh-command {
+        display: block; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px;
+        background: var(--dsw-alias-bg-base); overflow-wrap: anywhere; user-select: text;
+      }
+      .dsw-ssh-panel .ssh-confirm-details { display: grid; gap: 6px; margin: 0; }
+      .dsw-ssh-panel .ssh-confirm-details dt { color: var(--dsw-alias-label-secondary); font-size: 12px; }
+      .dsw-ssh-panel .ssh-confirm-details dd { margin: 0; overflow-wrap: anywhere; }
+      .dsw-ssh-panel .ssh-confirm-heading:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
       .dsw-ssh-panel .ssh-action {
         display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 5px 11px;
         border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; background: transparent;
@@ -169,8 +188,19 @@ window.__ModuleLoader__.load({
       grant: 'granted', revoke: 'revoked', restore: 'vault_restored',
     }
 
+    const hostKeyCommand = 'ssh-keygen -E sha256 -lf /etc/ssh/ssh_host_ed25519_key.pub'
+
     function DeviceEditor({ t, editing, disabled, submitForm, mutate, closeEditor, focusOnOpen, result }) {
       const [kind, setKind] = useState(editing ? 'keep' : 'password')
+      const [copyStatus, setCopyStatus] = useState(null)
+      async function copyCommand() {
+        try {
+          await navigator.clipboard.writeText(hostKeyCommand)
+          setCopyStatus('copiedCommand')
+        } catch {
+          setCopyStatus('copyCommandFailed')
+        }
+      }
       const { id, revision } = editing ?? {}
       return h('div', { className: 'ssh-stack ssh-inset' },
         h('h3', null, t(editing ? 'editDevice' : 'add')), result,
@@ -189,9 +219,14 @@ window.__ModuleLoader__.load({
           h('h3', null, t('hostKey')),
           field(t('fingerprint'), input('fingerprint', {
             className: 'ssh-control ssh-mono', required: true, maxLength: 50, defaultValue: editing?.fingerprint,
-            ref: editing?.verified === false ? focusOnOpen : undefined, placeholder: 'SHA256:…', spellCheck: false, 'aria-describedby': 'ssh-broker-host-key-help',
+            ref: editing?.verified === false ? focusOnOpen : undefined, placeholder: 'SHA256:…', spellCheck: false, 'aria-describedby': 'ssh-broker-host-key-help ssh-broker-host-key-paste',
           })),
           muted(t('hostKeyHelp'), { id: 'ssh-broker-host-key-help' }),
+          h('div', { className: 'ssh-row' },
+            h('code', { className: 'ssh-mono ssh-command' }, hostKeyCommand),
+            button(t('copyCommand'), { onClick: () => void copyCommand() })),
+          copyStatus && muted(t(copyStatus), { role: 'status' }),
+          muted(t('hostKeyPaste'), { id: 'ssh-broker-host-key-paste' }),
           check('pin', t('pin'))),
         h('div', { className: 'ssh-group ssh-divider' },
           field(t('credential'), selectField({ value: kind, onChange: (event) => setKind(event.target.value) },
@@ -220,6 +255,11 @@ window.__ModuleLoader__.load({
       const addDeviceButton = useRef(null)
       const restoreFocus = useRef(false)
       const [grantMode, setGrantMode] = useState('shellOnly')
+      const [duration, setDuration] = useState('timed')
+      const [grantReview, setGrantReview] = useState(null)
+      const grantSubmit = useRef(null)
+      const reviewHeading = useRef(null)
+      const returnToGrantForm = useRef(false)
       const lifetime = useRef(null)
       const pending = useRef(false)
       const statusRequest = useRef(null)
@@ -294,8 +334,24 @@ window.__ModuleLoader__.load({
         if (!unlocked) {
           setEditor(null)
           setGrantMode('shellOnly')
+          setDuration('timed')
+          setGrantReview(null)
+          returnToGrantForm.current = false
         }
       }, [unlocked])
+      const canShowGrantForm = unlocked && verified.length > 0 && sessions.length > 0
+      useEffect(() => {
+        if (!canShowGrantForm) setGrantReview(null)
+      }, [canShowGrantForm])
+      useEffect(() => {
+        if (grantReview) reviewHeading.current?.focus()
+      }, [grantReview])
+      useEffect(() => {
+        if (!grantReview && !disabled && returnToGrantForm.current) {
+          returnToGrantForm.current = false
+          grantSubmit.current?.focus()
+        }
+      }, [grantReview, disabled])
       useEffect(() => { if (editor) editorInput.current?.focus() }, [editor])
       useEffect(() => {
         if (busy || editor || !restoreFocus.current) return
@@ -333,6 +389,7 @@ window.__ModuleLoader__.load({
           h('div', { role: 'status' }, badge(t(unknown ? 'statusUnknown' : view?.vault ?? 'loading'), unlocked && !unknown)),
           unlocked && button(t('lock'), { disabled: busy, onClick: () => void mutate({ action: 'lock' }) })),
         feedback('vault'),
+        unlocked && !unknown && grants.some((grant) => grant.status === 'active' && grant.duration === 'session') && muted(t('vaultIdlePaused')),
         view?.vault === 'uninitialized' && muted(t('vaultHelp')),
         view?.vault === 'uninitialized' && actionForm('initialize', 'passphrase'),
         view?.vault === 'locked' && actionForm('unlock', 'passphrase'))
@@ -357,24 +414,67 @@ window.__ModuleLoader__.load({
           onSubmit: submitForm((data) => void mutate({ action: view.cleanupPending ? 'cleanup' : 'migrate', confirm: data.has('confirmLegacy') })),
         }, h('h3', null, t('legacy')), muted(describe(view.legacy)), check('confirmLegacy', t('confirmLegacy')),
         actions(submit(t(view.cleanupPending ? 'cleanup' : 'migrate'), disabled || (!view.legacy.credentialConfigured && !view.cleanupPending), 'secondary'))))
-      const grantForm = h('form', { className: 'ssh-inset ssh-stack', onSubmit: submitForm((data) => void mutate({
-        action: 'grant', deviceId: data.get('device'), agentId: data.get('agent'), ttlSeconds: Number(data.get('ttl')),
-        shell: grantMode !== 'transferOnly', transferDirectory: grantMode === 'shellOnly' ? undefined : data.get('transferDirectory'),
-        confirm: data.has('grant'),
-      }, () => setGrantMode('shellOnly'))) },
-      h('h3', null, t('newGrant')),
-      h('div', { className: 'ssh-grid' },
-        field(t('select'), selectField({ name: 'device', required: true, onChange: () => setGrantMode('shellOnly') },
-          choose('', t('select')), ...verified.map((device) => choose(device.id, `${device.label} · ${describe(device)} · ${device.id.slice(-8)}`)))),
-        field(t('session'), selectField({ name: 'agent', required: true, onChange: () => setGrantMode('shellOnly') },
-          choose('', t('choose')), ...sessions.map((id) => choose(id, sessionLabel(id))))),
-        field(t('grantMode'), selectField({ name: 'grantMode', value: grantMode, onChange: (event) => setGrantMode(event.target.value) },
-          ...['shellOnly', 'transferOnly', 'shellAndTransfer'].map((mode) => choose(mode, t(mode))))),
-        field(t('ttl'), input('ttl', { type: 'number', min: 1, max: 900, required: true, defaultValue: 300 }))),
-      grantMode !== 'shellOnly' && h('div', { className: 'ssh-group' },
-        field(t('transferDirectory'), input('transferDirectory', { required: true, maxLength: 1024, spellCheck: false, 'aria-describedby': 'ssh-broker-transfer-help' })),
-        muted(t('transferHelp'), { id: 'ssh-broker-transfer-help' })),
-      check('grant', t('confirmGrant')), actions(submit(t('grant'), disabled)))
+      function resetGrantForm() {
+        setGrantMode('shellOnly')
+        setDuration('timed')
+        setGrantReview(null)
+        returnToGrantForm.current = true
+      }
+      function prepareGrant(data) {
+        const device = verified.find(({ id }) => id === data.get('device'))
+        const agentId = data.get('agent')
+        if (disabled || !device || !sessions.includes(agentId) || !data.has('grant')) return
+        const payload = {
+          action: 'grant', deviceId: device.id, agentId, duration,
+          shell: grantMode !== 'transferOnly', transferDirectory: grantMode === 'shellOnly' ? undefined : data.get('transferDirectory'),
+          confirm: true,
+        }
+        if (duration === 'session') {
+          setNotice(null)
+          setGrantReview({ payload: { ...payload, deviceRevision: device.revision }, device, mode: grantMode })
+        } else {
+          void mutate({ ...payload, ttlSeconds: Number(data.get('ttl')) }, resetGrantForm)
+        }
+      }
+      const reviewCurrent = grantReview && sessions.includes(grantReview.payload.agentId) &&
+        verified.some(({ id, revision }) => id === grantReview.device.id && revision === grantReview.device.revision)
+      const grantForm = h('form', { className: 'ssh-inset ssh-stack', hidden: Boolean(grantReview), onSubmit: submitForm(prepareGrant) },
+        h('h3', null, t('newGrant')),
+        h('div', { className: 'ssh-grid' },
+          field(t('select'), selectField({ name: 'device', required: true, onChange: () => setGrantMode('shellOnly') },
+            choose('', t('select')), ...verified.map((device) => choose(device.id, `${device.label} · ${describe(device)} · ${device.id.slice(-8)}`)))),
+          field(t('session'), selectField({ name: 'agent', required: true, onChange: () => setGrantMode('shellOnly') },
+            choose('', t('choose')), ...sessions.map((id) => choose(id, sessionLabel(id))))),
+          field(t('grantMode'), selectField({ name: 'grantMode', value: grantMode, onChange: (event) => setGrantMode(event.target.value) },
+            ...['shellOnly', 'transferOnly', 'shellAndTransfer'].map((mode) => choose(mode, t(mode))))),
+          field(t('duration'), selectField({ name: 'duration', value: duration, onChange: (event) => setDuration(event.target.value) },
+            choose('timed', t('timed')), choose('session', t('sessionDuration')))),
+          duration === 'timed' && field(t('ttl'), input('ttl', { type: 'number', min: 1, max: 900, required: true, defaultValue: 300 }))),
+        grantMode !== 'shellOnly' && h('div', { className: 'ssh-group' },
+          field(t('transferDirectory'), input('transferDirectory', { required: true, maxLength: 1024, spellCheck: false, 'aria-describedby': 'ssh-broker-transfer-help' })),
+          muted(t('transferHelp'), { id: 'ssh-broker-transfer-help' })),
+        check('grant', t('confirmGrant')), actions(button(t(duration === 'session' ? 'reviewSessionGrant' : 'grant'), {
+          type: 'submit', variant: 'primary', ref: grantSubmit, disabled,
+        })))
+      const review = grantReview && h('div', { className: 'ssh-inset ssh-stack' },
+        h('h3', { className: 'ssh-confirm-heading', tabIndex: -1, ref: reviewHeading }, t('reviewSessionGrant')),
+        h('dl', { className: 'ssh-confirm-details' },
+          h('dt', null, t('select')), h('dd', null, `${grantReview.device.label} · ${describe(grantReview.device)} · ${grantReview.device.id.slice(-8)}`),
+          h('dt', null, t('session')), h('dd', null, sessionLabel(grantReview.payload.agentId)),
+          h('dt', null, t('grantMode')), h('dd', null, t(grantReview.mode)),
+          grantReview.payload.transferDirectory && h(ReactFragment, null,
+            h('dt', null, t('transferDirectory')), h('dd', null, h('code', null, grantReview.payload.transferDirectory))),
+          h('dt', null, t('duration')), h('dd', null, t('sessionDuration'))),
+        muted(t('sessionGrantHelp')), muted(t('sessionGrantEnd')),
+        !reviewCurrent && h('p', { className: 'ssh-warn', role: 'status' }, t('sessionGrantChanged')),
+        actions(button(t('back'), { disabled: busy, onClick: () => {
+          returnToGrantForm.current = true
+          setGrantReview(null)
+        } }), button(t('confirmSessionGrant'), { variant: 'primary', disabled: disabled || !reviewCurrent,
+          onClick: () => {
+            if (reviewCurrent && !disabled) void mutate({ ...grantReview.payload, confirmSession: true }, resetGrantForm)
+          },
+        })))
       const accessCard = h('section', { className: 'ssh-card ssh-stack' },
         h('h2', null, t('access')), muted(t('note')), feedback('access'),
         grants.length > 0 && h('ul', { className: 'ssh-list' }, ...grants.filter((grant) => !unknown || grant.status === 'active').map((grant) => h('li', {
@@ -384,12 +484,12 @@ window.__ModuleLoader__.load({
           badge(unknown ? t('lastKnown') : actionLabel(grant.status), !unknown && grant.status === 'active'),
           !unknown && muted(h(ReactFragment, null, t(grant.transferDirectory ? (grant.shell ? 'shellAndTransfer' : 'transferOnly') : 'shellOnly'),
             grant.transferDirectory && h('code', null, ` · ${grant.transferDirectory}`))),
-          !unknown && grant.status === 'active' && h('p', null, h('code', null, grant.id), ` · ${Math.ceil(grant.remainingMs / 1000)} s`)),
+          !unknown && grant.status === 'active' && h('p', null, h('code', null, grant.id), ` · ${grant.duration === 'session' ? t('sessionDuration') : `${Math.ceil(grant.remainingMs / 1000)} s`}`)),
         grant.status === 'active' && button(t('revoke'), {
           'aria-label': `${t('revoke')} · ${grant.deviceLabel} · ${sessionLabel(grant.agentId)}`,
           onClick: () => void mutate({ action: 'revoke', id: grant.id }), disabled: busy,
         })))),
-        unlocked && (verified.length && sessions.length ? grantForm : muted(t(verified.length ? 'noSessions' : 'noVerifiedDevices'))))
+        unlocked && (canShowGrantForm ? h(ReactFragment, null, grantForm, review) : muted(t(verified.length ? 'noSessions' : 'noVerifiedDevices'))))
       const backupCard = h('details', { className: 'ssh-card' }, h('summary', null, t('backupTools')),
         h('div', { className: 'ssh-stack' },
           feedback('backup'),
