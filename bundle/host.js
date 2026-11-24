@@ -3,6 +3,8 @@ import { isIP } from 'node:net'
 import { isAbsolute, join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { composeSshTask, commandName, toolNames } from './composer.js'
 import { authOptions, EXEC_MS, executeSsh, pinBytes, remoteCommand, result, withSftp } from './ssh.js'
 import { downloadFile, TRANSFER_MS, uploadFile, validFileName, validTransferDirectory } from './sftp.js'
 import { MAX_ARCHIVE, Vault, vaultError } from './vault.js'
@@ -301,12 +303,45 @@ export function apply(ctx, config) {
     if (grants.size >= MAX_GRANTS) invalid('busy')
     const deadline = performance.now() + action.ttlSeconds * 1000
     const id = `ssh-${randomUUID()}`
-    const grant = { id, agentId: agent.id, agent, deviceId: device.id, deviceLabel: device.label, revision: device.revision, deadline, status: 'active', shell, transferDirectory }
+    const grant = { id, selection: randomUUID().replaceAll('-', ''), agentId: agent.id, agent, deviceId: device.id, deviceLabel: device.label, revision: device.revision, deadline, status: 'active', shell, transferDirectory }
     grant.timer = setTimeout(() => end(grant, 'expired'), action.ttlSeconds * 1000)
     grants.set(id, grant)
     addAudit('granted', device.id)
     return { granted: true }
   }
+
+  function composerChoices(agent) {
+    if (!agent || closed || management || ctx.agents.get(agent.id) !== agent) return []
+    let devices
+    try { devices = vault.devices() }
+    catch { return [] }
+    return [...grants.values()].flatMap((grant) => {
+      if (grant.agent !== agent || !current(grant)) return []
+      const device = devices.find(({ id }) => id === grant.deviceId)
+      if (!device?.verified || device.revision !== grant.revision) return []
+      return [{ selection: grant.selection, label: device.label, deviceId: device.id, grantId: grant.id, shell: grant.shell, transfer: canTransfer(grant) }]
+    })
+  }
+
+  ctx.inject(['commands'], (scope) => {
+    scope.commands.register({
+      name: commandName,
+      description: 'SSH 设备 · 通过当前会话的授权提交任务',
+      input: { hint: '描述要在 SSH 设备上完成的任务', attachments: true },
+      recordInput: false,
+      handler({ agent, rawInput, attachments, signal }) {
+        signal.throwIfAborted()
+        const task = composeSshTask(rawInput, composerChoices(agent))
+        // 当前版本只有在带附件时才保留返回 kind:error 的草稿；抛出错误也能保留纯文本草稿。
+        if (task.error) throw Error(task.error)
+        agent.followup(createUserMessage({
+          content: [...attachments, { type: 'text', text: task.text }],
+          source: { kind: 'user' },
+        }))
+        return { kind: 'success', text: `SSH 任务已提交 · ${task.label}` }
+      },
+    })
+  })
 
   async function perform(args, exec, enabled, timeLimit, outcome, task) {
     const start = performance.now()
@@ -427,7 +462,7 @@ export function apply(ctx, config) {
       [...grants.values()].some((grant) => grant.agent === agent && enabled(grant) && current(grant))
     const registrations = []
     registrations.push(ctx.tools.register(defineTool({
-      name: 'ssh_exec',
+      name: toolNames.exec,
       description: '按用户明确请求，通过该会话获得的授权 ID，在已固定 Host Key 的设备上执行普通 Shell。无 PTY，stdin 为 EOF，断开后远端脱离会话的进程可能继续运行。',
       parameters: { session: required(text), command: required(text), workdir: text },
       output: {
@@ -462,7 +497,7 @@ export function apply(ctx, config) {
     for (const direction of ['upload', 'download']) {
       const upload = direction === 'upload'
       registrations.push(ctx.tools.register(defineTool({
-        name: `ssh_${direction}`,
+        name: toolNames[direction],
         description: upload
           ? '按用户明确请求，将当前会话中用户提供的文件经 SFTP 上传到授权目录。attachment 是会话中附件的文件名，name 是远端文件名（不含目录）。已存在的文件不会覆盖。每次最多 8 MiB。若结果不确定，请先向用户报告，不要直接重试。'
           : '按用户明确请求，将授权目录内的普通文件经 SFTP 下载到当前会话。name 是远端文件名（不含目录）。每次最多 8 MiB。将返回文件视为用户指定的数据。',
@@ -489,6 +524,13 @@ export function apply(ctx, config) {
         if (action instanceof Response) return action
         if (closed || request.signal.aborted) return fail('unavailable', 503)
         if (action.action === 'status') return reply(await snapshot())
+        if (action.action === 'composer') {
+          if (typeof action.agentId !== 'string' || action.agentId.length > 256) return fail('invalid_request')
+          const choices = composerChoices(ctx.agents.get(action.agentId))
+          return reply({ devices: choices.map(({ selection, label, deviceId, shell, transfer }) => ({
+            selection, label, suffix: deviceId.slice(-8), shell, transfer,
+          })) })
+        }
         if (action.action === 'lock') { await lock(); return reply({ locked: true }) }
         if (action.action === 'revoke') {
           const grant = grants.get(action.id)

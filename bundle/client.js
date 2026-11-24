@@ -41,7 +41,16 @@ window.__ModuleLoader__.load({
       granted: ['Access granted', '已授予权限'], device_saved: ['Device saved', '设备已保存'], device_deleted: ['Device deleted', '设备已删除'],
       device_migrated: ['Device migrated', '设备已迁移'], legacy_cleaned: ['Old credential removed', '旧凭据已清理'], vault_restored: ['Vault restored', '凭据库已恢复'],
       statusUnknown: ['Status is unavailable. An existing authorization may still be active.', '暂时无法确认状态。已有授权可能仍然有效。'],
-      note: ['Share an authorization ID only with the chosen conversation. Detached remote processes may continue after disconnect.', '仅将授权 ID 提供给选中的会话。连接断开后，脱离会话的远端进程可能继续运行。'],
+      composerTarget: ['SSH device', 'SSH 设备'],
+      composerChoose: ['Choose a device', '请选择设备'],
+      composerNoAccess: ['Grant this conversation access in Settings → SSH devices.', '请在「设置 → SSH 设备」为当前会话授权。'],
+      composerExpired: ['Selected authorization is unavailable', '所选设备的授权已失效'],
+      composerReauthorize: ['The selected authorization expired. Grant access again in Settings → SSH devices.', '所选设备的授权已失效，请在「设置 → SSH 设备」重新授权。'],
+      composerLoading: ['Checking SSH authorizations…', '正在检查 SSH 授权…'],
+      composerUnavailable: ['Could not check SSH authorizations.', '暂时无法读取 SSH 授权。'],
+      composerDraftChanged: ['The draft changed. Select a device again.', '草稿已变更，请重新选择设备。'],
+      composerAutomatic: ['Use the only authorized device at send time', '发送时自动使用唯一获授权的设备'],
+      note: ['Use /ssh-broker to attach an authorization automatically. Detached remote processes may continue after disconnect.', '使用 /ssh-broker 自动附带授权。连接断开后，脱离会话的远端进程可能继续运行。'],
       invalid_device: ['Check the device and confirm its fingerprint.', '请检查设备信息并确认指纹。'],
       invalid_credential: ['Enter a valid credential. An endpoint change requires a new credential.', '请输入有效凭据。变更连接信息时需要重新录入凭据。'],
       vault_locked: ['The vault is locked.', '凭据库已上锁。'], vault_exists: ['Vault already exists.', '凭据库已存在。'], vault_uninitialized: ['Create the vault first.', '请先创建凭据库。'],
@@ -108,6 +117,19 @@ window.__ModuleLoader__.load({
         .dsw-ssh-panel .ssh-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .dsw-ssh-panel .ssh-endpoint { grid-template-columns: minmax(0, 2fr) minmax(0, .8fr) minmax(0, 1.4fr); }
       }
+      .dsw-ssh-composer {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 7px 10px;
+        padding: 6px 10px; font-size: 12px; color: var(--dsw-alias-label-secondary);
+      }
+      .dsw-ssh-composer label { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+      .dsw-ssh-composer select {
+        max-width: 100%; min-width: 0; padding: 4px 8px; border-radius: 7px;
+        color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base);
+        border: 1px solid var(--dsw-alias-border-l2); font: inherit;
+      }
+      .dsw-ssh-composer select:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 2px; }
+      .dsw-ssh-composer select:disabled { opacity: .55; }
+      .dsw-ssh-composer .ssh-muted { margin: 0; }
     `
     const input = (name, props = {}) => h('input', { name, autoComplete: 'off', className: props.type === 'checkbox' ? undefined : 'ssh-control', ...props })
     const selectField = (props, ...children) => h('select', { className: 'ssh-control', ...props }, ...children)
@@ -390,12 +412,84 @@ window.__ModuleLoader__.load({
           h('ul', { className: 'ssh-list' }, ...view.audit.map((row, i) => h('li', { key: `${row.time}-${i}`, className: 'ssh-muted' },
             `${new Date(row.time).toLocaleTimeString()} · ${actionLabel(row.status)}${row.deviceId ? ` · ${row.deviceId.slice(-8)}` : ''}${row.elapsedMs === undefined ? '' : ` · ${row.elapsedMs} ms`}`)))))
     }
+    const composerCommand = 'ssh-broker'
+    const composerToken = /^\s*\/ssh-broker(?=\s|$)/
+    const composerSelection = /^\s+--device ([0-9a-f]{32}) --(?=\s|$)/
+
+    function ComposerTarget({ t, sessionId, draft, claim, phase, inputActions }) {
+      const [devices, setDevices] = useState(null)
+      const [error, setError] = useState(null)
+      const [draftChanged, setDraftChanged] = useState(false)
+
+      useEffect(() => {
+        const lifetime = new AbortController()
+        let timer
+        async function refresh() {
+          try {
+            const view = await call({ action: 'composer', agentId: sessionId }, lifetime.signal)
+            if (lifetime.signal.aborted) return
+            setDevices(view.devices)
+            setError(null)
+          } catch {
+            if (!lifetime.signal.aborted) setError('composerUnavailable')
+          } finally {
+            if (!lifetime.signal.aborted) timer = setTimeout(refresh, 2000)
+          }
+        }
+        void refresh()
+        return () => { clearTimeout(timer); lifetime.abort() }
+      }, [sessionId])
+
+      const match = composerToken.exec(draft)
+      if (!match) return null
+      const tokenEnd = match[0].length
+      const selector = composerSelection.exec(draft.slice(tokenEnd))
+      const selected = selector?.[1] ?? ''
+      const active = devices?.find((device) => device.selection === selected)
+      const missing = Boolean(selected && devices && !active)
+      const editable = phase === 'plain' || phase === 'claimed'
+
+      function select(event) {
+        const id = event.target.value
+        const span = inputActions.captureInsertion()
+        // 指令 chip 在编辑器的插入坐标里占一个位置，草稿文本里则展开为完整指令。
+        const start = claim?.name === composerCommand ? 1 : tokenEnd
+        const end = start + (selector?.[0].length ?? 0)
+        const separator = /^\s/.test(draft.slice(tokenEnd + (selector?.[0].length ?? 0))) ? '' : ' '
+        const text = id ? ` --device ${id} --${separator}` : separator
+        setDraftChanged(!inputActions.insertText(text, { ...span, start, end }))
+      }
+
+      const mode = (device) => t(device.transfer ? (device.shell ? 'shellAndTransfer' : 'transferOnly') : 'shellOnly')
+      const sameLabel = (device) => devices?.some((other) => other !== device && other.label === device.label)
+      const optionLabel = (device) => `${device.label}${sameLabel(device) ? ` · ${device.suffix}` : ''} · ${mode(device)}`
+      const notice = error ?? (draftChanged ? 'composerDraftChanged' : devices === null ? 'composerLoading' :
+        missing && devices.length === 0 ? 'composerReauthorize' : missing ? 'composerExpired' : devices.length === 0 ? 'composerNoAccess' : null)
+      const automatic = devices?.length === 1 ? t('composerAutomatic') : t('composerChoose')
+      return h('div', { className: 'dsw-ssh-composer' },
+        h('style', null, styles),
+        Boolean(devices?.length || selected) && h('label', null, t('composerTarget'),
+          h('select', { value: selected, onChange: select, disabled: !editable || Boolean(error) || !devices?.length },
+            choose('', automatic),
+            missing && h('option', { value: selected, disabled: true }, t('composerExpired')),
+            ...(devices ?? []).map((device) => choose(device.selection, optionLabel(device))))),
+        notice && muted(t(notice), { role: 'status' }))
+    }
+
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(ns, { en: translations(0), zh: translations(1) }))
         const t = ctx.locale.bind(ns)
         ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'ssh-broker', label: () => t('title'), order: 95 }, ({ useSessions }) => h(Panel, { t, useSessions })))
+        ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({ name: 'conversation.input.dock', id: 'ssh-broker', order: 25 }, ({ sessionId, useAccess, useInput, inputActions }) => {
+          const draft = useInput((input) => input.draft)
+          const claim = useInput((input) => input.claim)
+          const phase = useInput((input) => input.phase)
+          const canExecute = useAccess('commands/execute')
+          if (!canExecute || !composerToken.test(draft) || (claim && claim.name !== composerCommand)) return null
+          return h(ComposerTarget, { key: sessionId, t, sessionId, draft, claim, phase, inputActions })
+        }))
       },
     }
   },
