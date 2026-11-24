@@ -1,0 +1,3 @@
+- insert:
+    - id: ssh-broker
+      name: '@local/dsh-ssh-broker'

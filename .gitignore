@@ -1,0 +1,12 @@
+node_modules/
+*.tgz
+*.log
+.env
+.env.*
+.dsh/
+.dsh-test*/
+.release-verify*/
+.phase*-test*/
+.credentials.yaml
+*.pem
+*.key
