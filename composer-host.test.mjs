@@ -11,7 +11,7 @@ const { DSH_TEST_ROOT, DSH_TEST_SSH_PACKAGE } = process.env
 
 test('SSH composer confines task admission to the live receiving session and selected grant', {
   skip: !DSH_TEST_ROOT || !DSH_TEST_SSH_PACKAGE ? 'Set DSH_TEST_ROOT and DSH_TEST_SSH_PACKAGE to run the Host integration test.' : false,
-}, async () => {
+}, async (t) => {
   const hostRequire = createRequire(resolve(DSH_TEST_ROOT, 'package.json'))
   const sshRequire = createRequire(resolve(DSH_TEST_SSH_PACKAGE, 'package.json'))
   const hooks = registerHooks({
@@ -39,21 +39,23 @@ test('SSH composer confines task admission to the live receiving session and sel
   let command
   let route
   let dispose
+  const events = new Map()
   const ctx = {
     agents: { get: (id) => agents.get(id), list: () => [...agents.values()] },
     fiber: { entry: { id: 'fixture' } }, profileContext: { dir: directory },
     connection: { browserPeer: peer, admit: () => ({ peer }), fetch: { register: (definition) => { route = definition } } },
     tools: { register: (tool, options) => { tools.set(tool.name, options); return () => tools.delete(tool.name) } },
     inject: (deps, fn) => { assert.deepEqual(deps, ['commands']); fn({ commands: { register: (definition) => { command = definition } } }) },
-    effect: (fn) => { dispose = fn() }, on() {},
+    effect: (fn) => { dispose = fn() }, on: (name, fn) => events.set(name, fn),
   }
-  const send = async (body) => {
+  const send = async (body, status = 200) => {
     const response = await route.fetch(new Request('http://localhost/api/dsh-ssh-broker', {
       method: 'POST', headers: { origin: 'http://localhost', host: 'localhost', 'content-type': 'application/json' },
       body: JSON.stringify(body),
     }))
-    assert.equal(response.status, 200)
-    return response.json()
+    const data = await response.json()
+    assert.equal(response.status, status, JSON.stringify(data))
+    return data
   }
   const list = (agentId) => send({ action: 'composer', agentId })
   const authorize = (id, agent, fields = {}) => send({ action: 'grant', deviceId: id, agentId: agent.id, ttlSeconds: 300, confirm: true, ...fields })
@@ -108,6 +110,58 @@ test('SSH composer confines task admission to the live receiving session and sel
     assert.deepEqual(await list(first.id), { devices: [] })
     assert.throws(() => submit(choose(transfer, '上传附件')), /授权已失效/)
     assert.equal(messages.length, 2)
+
+    await t.test('会话授权跨越空闲期，随撤销、会话关闭或上锁失效', async (t) => {
+      t.mock.timers.enable({ apis: ['setTimeout'] })
+      const idleMs = 10 * 60_000
+      const passphrase = 'local fixture passphrase'
+      await send({ action: 'unlock', passphrase })
+      const deviceRevision = (await state()).devices.find(({ id }) => id === a).revision
+      const sessionGrant = { action: 'grant', deviceId: a, agentId: first.id, duration: 'session', deviceRevision, confirm: true }
+      assert.deepEqual(await send(sessionGrant, 409), { error: 'invalid_grant' })
+      assert.deepEqual(await send({ ...sessionGrant, confirmSession: true, deviceRevision: 'old' }, 409), { error: 'stale_device' })
+      assert.deepEqual(await send({ ...sessionGrant, confirmSession: true, ttlSeconds: 300 }, 409), { error: 'invalid_grant' })
+      assert.deepEqual(await send({ ...sessionGrant, duration: 'timed', ttlSeconds: 901 }, 409), { error: 'invalid_grant' })
+      await send({ ...sessionGrant, confirmSession: true })
+      const bRevision = (await state()).devices.find(({ id }) => id === b).revision
+      await send({ ...sessionGrant, deviceId: b, deviceRevision: bRevision, agentId: second.id, confirmSession: true })
+      t.mock.timers.tick(8 * 60 * 60_000)
+      assert.equal((await state()).vault, 'unlocked')
+      const active = (await state()).grants.filter(({ status }) => status === 'active')
+      assert.equal(active.length, 2)
+      assert(active.every(({ duration, remainingMs }) => duration === 'session' && remainingMs === null))
+      assert.equal(submit('检查系统信息').kind, 'success')
+      await send({ action: 'revoke', id: active.find(({ deviceId }) => deviceId === a).id })
+      t.mock.timers.tick(idleMs + 1)
+      assert.equal((await state()).vault, 'unlocked')
+      assert.deepEqual(await list(first.id), { devices: [] })
+      events.get('agent/disposed')({ agent: { ...second } })
+      assert.equal((await list(second.id)).devices.length, 1)
+      events.get('agent/disposed')({ agent: second })
+      assert.deepEqual(await list(second.id), { devices: [] })
+      assert.equal((await state()).grants.find(({ id }) => id === active.find(({ deviceId }) => deviceId === b).id).status, 'session_closed')
+      t.mock.timers.tick(idleMs - 1)
+      assert.equal((await state()).vault, 'unlocked')
+      t.mock.timers.tick(1)
+      assert.equal((await state()).vault, 'locked')
+      await send({ action: 'unlock', passphrase })
+      await authorize(a, first, { ttlSeconds: 1 })
+      t.mock.timers.tick(1000)
+      assert.equal((await state()).grants[0].status, 'expired')
+      await send({ ...sessionGrant, confirmSession: true })
+      await send({ action: 'lock' })
+      assert.deepEqual(await list(first.id), { devices: [] })
+      assert.equal((await state()).grants[0].status, 'vault_locked')
+      await send({ action: 'unlock', passphrase })
+      await send({ ...sessionGrant, confirmSession: true })
+      await dispose()
+      assert.equal(tools.size, 0)
+      apply(ctx, { device: { get: () => ({}) } })
+      assert.equal((await state()).vault, 'locked')
+      assert.deepEqual((await state()).grants, [])
+      await send({ action: 'unlock', passphrase })
+      assert.deepEqual(await list(first.id), { devices: [] })
+    })
   } finally {
     await dispose?.()
     assert(directory.startsWith(join(tmpdir(), 'ssh-composer-test-')))

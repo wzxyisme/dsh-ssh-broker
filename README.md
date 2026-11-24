@@ -1,15 +1,15 @@
 # SSH 设备 · DeepSeek Harness 插件
 
-这是一个非官方的 DeepSeek Harness Web 插件。在本地加密凭据库中管理 SSH 设备，核对主机指纹后，将短期 Shell 或 SFTP 权限授予你选中的会话。SFTP 默认关闭，不需要时不要开启。
+这是一个非官方的 DeepSeek Harness Web 插件。在本地加密凭据库中管理 SSH 设备，核对主机指纹后，为选中的会话授予限时或仅本次会话有效的 Shell 或 SFTP 权限。SFTP 默认关闭，不需要时不要开启。
 
 ## 安装
 
 此版本只验证了 Linux 上的 **DSH Web `0.2.2-rc.5`** 与 **Node.js `24.22.1`**。清单要求 Node.js `>=24`，并将 DSH 锁定于 `0.2.2-rc.5`。请勿为其他 DSH 版本强制豁免。
 
-如已取得 `local-dsh-ssh-broker-0.4.0.tgz`，从归档所在目录执行（将 `web` 换成你使用的 Profile 名称）：
+如已取得 `local-dsh-ssh-broker-0.5.0.tgz`，从归档所在目录执行（将 `web` 换成你使用的 Profile 名称）：
 
 ```sh
-dsh plugin --profile web add ./local-dsh-ssh-broker-0.4.0.tgz --ignore-scripts
+dsh plugin --profile web add ./local-dsh-ssh-broker-0.5.0.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` 不运行依赖的安装脚本；本插件无需为 SSH 依赖启用本机编译。如果尚未发布归档，可从本仓库的 `bundle/` 打包。上面的命令安装的是整个 Profile 的 Host 插件；仅安装你已核对来源的归档。安装完成后启动或重启对应 Profile，在「设置 → SSH 设备」中使用。

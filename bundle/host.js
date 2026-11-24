@@ -137,7 +137,10 @@ export function apply(ctx, config) {
     const operation = operations.get(grant.deviceId)
     if (operation?.grant === grant) operation.controller.abort(status)
     addAudit(status, grant.deviceId)
+    if (grant.deadline === null) touch()
   }
+
+  const holdsVaultOpen = (grant) => grant.deadline === null && grant.status === 'active'
 
   function endForDevice(id, status) {
     for (const grant of grants.values()) if (grant.deviceId === id) end(grant, status)
@@ -145,20 +148,22 @@ export function apply(ctx, config) {
 
   function lock(status = 'vault_locked') {
     ++lockGeneration
-    clearTimeout(idle)
     for (const grant of grants.values()) end(grant, status)
+    clearTimeout(idle)
     return vault.lock()
   }
 
   function touch() {
     clearTimeout(idle)
+    // 会话授权需要跨越两次远端操作之间的空闲期。最后一条结束后恢复空闲计时。
+    if (closed || [...grants.values()].some(holdsVaultOpen)) return
     idle = setTimeout(() => { void lock().catch(() => addAudit('vault_io')) }, IDLE_MS)
     idle.unref?.()
   }
 
   function current(grant) {
     if (!grant || grant.status !== 'active' || closed) return false
-    if (performance.now() >= grant.deadline) end(grant, 'expired')
+    if (grant.deadline !== null && performance.now() >= grant.deadline) end(grant, 'expired')
     else if (ctx.agents.get(grant.agentId) !== grant.agent) end(grant, 'session_closed')
     return grant.status === 'active'
   }
@@ -191,7 +196,9 @@ export function apply(ctx, config) {
       cleanupPending: Boolean(old && unlocked.some((device) => device.id === old.id && device.migrated === true)),
       sessions: ctx.agents.list().slice(-100).map(({ id }) => id),
       grants: [...grants.values()].reverse().map(({ id, deviceId, deviceLabel, agentId, status, deadline, shell, transferDirectory }) => ({
-        id, deviceId, deviceLabel, agentId, status, shell, transferDirectory, remainingMs: status === 'active' ? Math.max(0, Math.ceil(deadline - performance.now())) : 0,
+        id, deviceId, deviceLabel, agentId, status, shell, transferDirectory,
+        duration: deadline === null ? 'session' : 'timed',
+        remainingMs: deadline === null ? null : status === 'active' ? Math.max(0, Math.ceil(deadline - performance.now())) : 0,
         busy: operations.get(deviceId)?.grant.id === id,
       })),
       audit: audit.slice(), busy: Boolean(management),
@@ -287,7 +294,13 @@ export function apply(ctx, config) {
   function authorize(action) {
     const device = vault.devices().find(({ id }) => id === action.deviceId)
     if (!device?.verified) invalid('not_ready')
-    if (typeof action.agentId !== 'string' || action.agentId.length > 256 || !Number.isInteger(action.ttlSeconds) || action.ttlSeconds < 1 || action.ttlSeconds > 900 || action.confirm !== true) invalid('invalid_grant')
+    if (typeof action.agentId !== 'string' || action.agentId.length > 256 || action.confirm !== true) invalid('invalid_grant')
+    const sessionDuration = action.duration === 'session'
+    if (sessionDuration) {
+      if (action.confirmSession !== true || action.ttlSeconds !== undefined) invalid('invalid_grant')
+      if (device.revision !== action.deviceRevision) invalid('stale_device')
+    } else if ((action.duration !== undefined && action.duration !== 'timed') ||
+        !Number.isInteger(action.ttlSeconds) || action.ttlSeconds < 1 || action.ttlSeconds > 900) invalid('invalid_grant')
     const shell = action.shell ?? true
     const { transferDirectory } = action
     if (typeof shell !== 'boolean' || (!shell && transferDirectory === undefined)) invalid('invalid_grant')
@@ -301,11 +314,12 @@ export function apply(ctx, config) {
       if (grant.status !== 'active') grants.delete(id)
     }
     if (grants.size >= MAX_GRANTS) invalid('busy')
-    const deadline = performance.now() + action.ttlSeconds * 1000
+    const deadline = sessionDuration ? null : performance.now() + action.ttlSeconds * 1000
     const id = `ssh-${randomUUID()}`
     const grant = { id, selection: randomUUID().replaceAll('-', ''), agentId: agent.id, agent, deviceId: device.id, deviceLabel: device.label, revision: device.revision, deadline, status: 'active', shell, transferDirectory }
-    grant.timer = setTimeout(() => end(grant, 'expired'), action.ttlSeconds * 1000)
+    if (!sessionDuration) grant.timer = setTimeout(() => end(grant, 'expired'), action.ttlSeconds * 1000)
     grants.set(id, grant)
+    if (sessionDuration) touch()
     addAudit('granted', device.id)
     return { granted: true }
   }
