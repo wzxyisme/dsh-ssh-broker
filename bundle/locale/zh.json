@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "SSH 设备",
+    "description": "使用本地加密库管理 SSH 设备。核实每台设备的 Host Key 指纹，再为指定 Harness 会话授予短期访问权限。"
+  }
+}

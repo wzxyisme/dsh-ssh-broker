@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-ssh-broker",
+  "version": "0.3.0",
+  "description": "Session-scoped SSH and opt-in SFTP with an encrypted local device vault",
+  "private": true,
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/wzxyisme/dsh-ssh-broker.git", "directory": "bundle" },
+  "bugs": { "url": "https://github.com/wzxyisme/dsh-ssh-broker/issues" },
+  "type": "module",
+  "engines": { "node": ">=24", "dsh": "0.2.2-rc.5" },
+  "exports": {
+    ".": "./host.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": ["host.js", "client.js", "ssh.js", "sftp.js", "vault.js", "cordis.patch.yml", "icon.svg", "locale/*.json", "README.md"],
+  "dependencies": { "ssh2": "1.17.0" },
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": { "platform": "web", "immediately": true, "inject": ["@deepseek-ai/dsh-client-locale", "@deepseek-ai/dsh-client-ui-settings"] }
+  }
+}
