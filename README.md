@@ -16,14 +16,13 @@ SSH Broker 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 
 ## 安装或升级
 
-从 [GitHub Release v0.7.2](https://github.com/wzxyisme/dsh-ssh-broker/releases/tag/v0.7.2) 下载 `local-dsh-ssh-broker-0.7.2.tgz` 和 `SHA256SUMS`，在下载目录执行：
-
 ```sh
-sha256sum -c SHA256SUMS
-dsh plugin --profile web add ./local-dsh-ssh-broker-0.7.2.tgz --ignore-scripts
+dsh plugin --profile web add dsh-ssh-broker
 ```
 
-如果使用其他 Web Profile，把 `web` 替换为对应名称。升级时无需先卸载；完成后重启对应的 DSH 服务，再打开「设置 → SSH 设备」。无需运行依赖的原生构建脚本。不要为未验证的 DSH 版本强制豁免兼容性检查。
+如果使用其他 Web Profile，把 `web` 替换为对应名称。安装后重启对应的 DSH 服务，再打开「设置 → SSH 设备」。插件随包提供 SSH 的纯 JavaScript 依赖，不需要批准原生构建脚本。不要为未验证的 DSH 版本强制豁免兼容性检查。
+
+**如果安装过 0.7.2 或更早的测试包**：新版的包名与插件条目 ID 均为 `dsh-ssh-broker`，不会读取或删除旧 ID 的凭据库。若需保留设备，在卸载前从旧版导出加密备份，运行 `dsh plugin --profile web remove @local/dsh-ssh-broker`，再安装新版。启动后可将备份恢复到空凭据库，并重新核验各设备的主机指纹。不要同时安装两个版本。
 
 ## 快速开始
 
