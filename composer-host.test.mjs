@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createRequire, registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -10,6 +12,7 @@ import { pathToFileURL } from 'node:url'
 import { commandName, toolNames } from './bundle/composer.js'
 
 const { DSH_TEST_ROOT, DSH_TEST_SSH_PACKAGE } = process.env
+const sftpServer = ['/usr/lib/openssh/sftp-server', '/usr/libexec/openssh/sftp-server', '/usr/libexec/sftp-server'].find(existsSync)
 
 test('SSH composer confines task admission to the live receiving session and selected grant', {
   skip: !DSH_TEST_ROOT || !DSH_TEST_SSH_PACKAGE ? 'Set DSH_TEST_ROOT and DSH_TEST_SSH_PACKAGE to run the Host integration test.' : false,
@@ -51,9 +54,9 @@ test('SSH composer confines task admission to the live receiving session and sel
     inject: (deps, fn) => { assert.deepEqual(deps, ['commands']); fn({ commands: { register: (definition) => { command = definition } } }) },
     effect: (fn) => { dispose = fn() }, on: (name, fn) => events.set(name, fn),
   }
-  const send = async (body, status = 200) => {
+  const send = async (body, status = 200, origin = 'http://localhost') => {
     const response = await route.fetch(new Request('http://localhost/api/dsh-ssh-broker', {
-      method: 'POST', headers: { origin: 'http://localhost', host: 'localhost', 'content-type': 'application/json' },
+      method: 'POST', headers: { origin, host: 'localhost', 'content-type': 'application/json' },
       body: JSON.stringify(body),
     }))
     const data = await response.json()
@@ -104,6 +107,7 @@ test('SSH composer confines task admission to the live receiving session and sel
     const attachment = { type: 'file', attachment: { attachmentId: 'fixture', name: 'fixture.txt', bytes: 1 } }
     assert.equal(submit(choose(transfer, '上传附件'), { attachments: [attachment] }).kind, 'success')
     assert.deepEqual(messages[1].content[0], attachment)
+    assert.match(messages[1].content[1].text, /dsh_ssh_broker_list/)
     assert.match(messages[1].content[1].text, /dsh_ssh_broker_upload/)
     assert.doesNotMatch(messages[1].content[1].text, /dsh_ssh_broker_exec|--device|fixture-only-password/)
     await send({ action: 'revoke', id: shellGrant.id })
@@ -236,12 +240,147 @@ test('SSH composer confines task admission to the live receiving session and sel
         assert.equal(output.stderr, stderr)
         assert.equal(output.stdoutTruncated, true)
         assert.equal(output.stderrTruncated, false)
+        await send({ action: 'revoke', id: session })
       } finally {
         controller.abort()
         try { await execution }
         finally {
           if (server.address()) await new Promise((resolve) => server.close(resolve))
         }
+      }
+    })
+    await t.test('SFTP 目录预览与子目录授权', { skip: !sftpServer && '需要本机 OpenSSH sftp-server' }, async () => {
+      const root = await realpath(directory)
+      const inbox = join(root, 'inbox')
+      const reports = join(inbox, 'reports')
+      const outside = join(root, 'outside')
+      await mkdir(reports, { recursive: true })
+      await mkdir(join(outside, 'hidden'), { recursive: true })
+      await writeFile(join(inbox, 'root.txt'), 'top level')
+      await writeFile(join(reports, 'summary.txt'), 'nested file')
+      await writeFile(join(inbox, '.dsh-sftp-fixture'), 'staging file')
+      await symlink(outside, join(inbox, 'linked-dir'))
+      await symlink(join(inbox, 'root.txt'), join(inbox, 'linked-file'))
+
+      const { private: hostKey } = utils.generateKeyPairSync('ed25519')
+      const fingerprint = `SHA256:${createHash('sha256').update(utils.parseKey(hostKey).getPublicSSH()).digest('base64').slice(0, -1)}`
+      const password = 'sftp-fixture-only'
+      const subprocesses = []
+      const clients = new Set()
+      let connections = 0
+      const server = new Server({ hostKeys: [hostKey] }, (client) => {
+        connections++
+        clients.add(client)
+        client.once('close', () => clients.delete(client))
+        client.on('error', () => {})
+        client.on('authentication', (auth) => {
+          if (auth.method === 'password' && auth.username === 'fixture' && auth.password === password) auth.accept()
+          else auth.reject()
+        })
+        client.on('session', (accept) => {
+          accept().on('subsystem', (acceptSubsystem, rejectSubsystem, { name }) => {
+            if (name !== 'sftp') return rejectSubsystem()
+            const stream = acceptSubsystem()
+            const child = spawn(sftpServer, [], { stdio: ['pipe', 'pipe', 'ignore'] })
+            subprocesses.push({ child, closed: once(child, 'close') })
+            child.stdin.on('error', () => {})
+            stream.once('close', () => child.stdin.end())
+            stream.pipe(child.stdin)
+            child.stdout.pipe(stream)
+          })
+        })
+      })
+      const fixture = Buffer.from('attachment data')
+      const source = { attachmentId: 'fixture-source', name: 'source.txt', bytes: fixture.length }
+      let downloaded
+      first.session = { id: first.id }
+      ctx.sessionQuery = { observeSession: async () => ({
+        inheritedEventCount: 0,
+        events: [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'file', attachment: source }] } }],
+        [Symbol.dispose]() {},
+      }) }
+      ctx.attachments = {
+        async *readFileStream(ref) { assert.equal(ref, source); yield fixture },
+        async saveFileStream({ data, name }) {
+          const chunks = []
+          for await (const chunk of data) chunks.push(chunk)
+          downloaded = Buffer.concat(chunks)
+          return { attachmentId: 'fixture-download', name, bytes: downloaded.length }
+        },
+      }
+      try {
+        const listening = once(server, 'listening')
+        server.listen(0, '127.0.0.1')
+        await listening
+        await send({ action: 'configure', host: '127.0.0.1', port: server.address().port, username: 'fixture', label: 'SFTP 测试',
+          fingerprint, credential: { kind: 'password', value: password }, confirmFingerprint: true })
+        const device = (await state()).devices.find(({ label }) => label === 'SFTP 测试')
+        const fields = { shell: false, transferDirectory: inbox }
+        const createGrant = async (options) => {
+          await authorize(device.id, first, { ...fields, ...options })
+          return (await state()).grants.find(({ deviceId, status }) => deviceId === device.id && status === 'active')
+        }
+        let grant = await createGrant()
+        const preview = () => ({ action: 'previewDirectory', id: grant.id })
+        const revoke = () => send({ action: 'revoke', id: grant.id })
+        const run = (name, args = {}, agent = first) => tools.get(toolNames[name]).tool.execute({ session: grant.id, ...args }, {
+          agent, signal: AbortSignal.timeout(5000),
+        })
+        const expectEntries = (result, entries) => {
+          assert.equal(result.status, 'listed')
+          assert.equal(result.truncated, false)
+          assert.deepEqual(result.entries.toSorted((a, b) => a.name.localeCompare(b.name)), entries)
+        }
+        assert.equal(grant.includeSubdirectories, false)
+        assert(tools.get(toolNames.list).when({ agent: first }))
+        assert(!tools.get(toolNames.exec).when({ agent: first }))
+        assert(!tools.get(toolNames.list).when({ agent: second }))
+        assert.equal((await run('list', {}, second)).status, 'not_authorized')
+        assert.equal((await run('list', { path: 'reports' })).status, 'subdirectories_not_allowed')
+        assert.equal((await run('download', { name: 'reports/summary.txt' })).status, 'subdirectories_not_allowed')
+        assert.equal((await run('upload', { name: 'reports/new.txt', attachment: source.name })).status, 'subdirectories_not_allowed')
+        assert.deepEqual(await send(preview(), 403, 'http://another-origin'), { error: 'forbidden' })
+        assert.equal(connections, 0)
+        const rootEntries = [{ name: 'reports', type: 'directory' }, { name: 'root.txt', type: 'file' }]
+        expectEntries(await send(preview()), rootEntries)
+        expectEntries(await run('list'), rootEntries)
+        const rootDownload = await run('download', { name: 'root.txt' })
+        assert.equal(rootDownload.status, 'downloaded')
+        assert.equal(downloaded.toString(), 'top level')
+        await revoke()
+        assert.equal((await send(preview())).status, 'revoked')
+        assert.deepEqual((await run('list')).entries, [])
+        assert(!tools.get(toolNames.list).when({ agent: first }))
+
+        grant = await createGrant({ includeSubdirectories: true })
+        assert.equal(grant.includeSubdirectories, true)
+        expectEntries(await run('list', { path: 'reports' }), [{ name: 'summary.txt', type: 'file' }])
+        expectEntries(await send(preview()), rootEntries)
+        for (const path of ['/reports', 'reports/../reports', 'reports//nested']) {
+          assert.equal((await run('list', { path })).status, 'invalid_arguments')
+        }
+        assert.equal((await run('list', { path: 'linked-dir/hidden' })).status, 'remote_directory_changed')
+        assert.equal((await run('download', { name: 'linked-file' })).status, 'remote_not_regular_file')
+        assert.equal((await run('upload', { name: 'linked-dir/hidden/new.txt', attachment: source.name })).status, 'remote_directory_changed')
+        const result = await run('download', { name: 'reports/summary.txt' })
+        assert.equal(result.status, 'downloaded')
+        assert.equal(result.attachment.name, 'summary.txt')
+        assert.equal(downloaded.toString(), 'nested file')
+        const upload = { name: 'reports/new.txt', attachment: source.name }
+        assert.equal((await run('upload', upload)).status, 'uploaded')
+        assert.equal((await run('upload', upload)).status, 'remote_exists')
+        assert.deepEqual(await readFile(join(reports, 'new.txt')), fixture)
+        await Promise.all(Array.from({ length: 101 }, (_, index) => writeFile(join(reports, `entry-${index}`), '')))
+        const limited = await run('list', { path: 'reports' })
+        assert.equal(limited.status, 'listed')
+        assert.equal(limited.entries.length, 100)
+        assert.equal(limited.truncated, true)
+        await revoke()
+      } finally {
+        for (const client of clients) client.end()
+        for (const { child } of subprocesses) child.stdin.end()
+        if (server.address()) await new Promise((resolve) => server.close(resolve))
+        await Promise.all(subprocesses.map(({ closed }) => closed))
       }
     })
   } finally {
