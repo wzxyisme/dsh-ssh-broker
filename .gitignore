@@ -1,4 +1,6 @@
 node_modules/
+/dist/
+/SHA256SUMS
 *.tgz
 *.log
 .env

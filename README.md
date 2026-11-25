@@ -1,39 +1,60 @@
-# SSH 设备 · DeepSeek Harness 插件
+# SSH Broker · SSH 设备
 
-这是一个非官方的 DeepSeek Harness Web 插件。在本地加密凭据库中管理 SSH 设备，核对主机指纹后，为选中的会话授予限时或仅本次会话有效的 Shell 或 SFTP 权限。SFTP 默认关闭，不需要时不要开启。
+简体中文 | [English](README.en.md)
 
-## 安装
+SSH Broker 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web 的非官方插件。它在当前 Profile 中保存加密的 SSH 凭据，你可以按设备、会话和权限范围，授权助手执行非交互式命令或进行 SFTP 文件操作。
 
-此版本只验证了 Linux 上的 **DSH Web `0.2.2-rc.5`** 与 **Node.js `24.22.1`**。清单要求 Node.js `>=24`，并将 DSH 锁定于 `0.2.2-rc.5`。请勿为其他 DSH 版本强制豁免。
+## 兼容性
 
-如已取得 `local-dsh-ssh-broker-0.7.0.tgz`，从归档所在目录执行（将 `web` 换成你使用的 Profile 名称）：
+| 项目 | 要求 |
+| --- | --- |
+| DeepSeek Harness | **Web `0.2.2-rc.5`**；安装清单锁定该版本 |
+| Node.js | `>=24`；在 Linux、Node.js `24.22.1` 上验证 |
+| 远端 | 可从 DSH Host 访问的 SSH 服务；文件操作另需 SFTP 支持 |
 
-```sh
-dsh plugin --profile web add ./local-dsh-ssh-broker-0.7.0.tgz --ignore-scripts
-```
+原生桌面客户端及非 Linux Host 未验证。工作区文件上传、校验和替换需要 Host 可访问本机工作区并提供 Linux `/proc/self/fd`。
 
-`--ignore-scripts` 不运行依赖的安装脚本；本插件无需为 SSH 依赖启用本机编译。如果尚未发布归档，可从本仓库的 `bundle/` 打包。上面的命令安装的是整个 Profile 的 Host 插件；仅安装你已核对来源的归档。安装完成后启动或重启对应 Profile，在「设置 → SSH 设备」中使用。
+## 安装或升级
 
-## 使用与安全边界
-
-- 从可信渠道核对目标机的 Host Key 指纹，使用专用低权限账号。不要把 SSH 私钥、密码或凭据库口令发给助手。
-- 为当前会话授权后，在 Harness 的「＋」或斜杠菜单选择 `/ssh-broker`，填写任务并发送。只有一台设备获授权时自动使用它，多台时先选设备。自 `0.4.0` 起，模型工具统一使用 `dsh_ssh_broker_` 前缀。
-- 授权绑定设备和会话，有效期内可撤销。选择「仅文件传输」并指定远端目录后，可在设置页按需预览根目录，也可以让助手列出目录。默认只允许传输根目录的直属文件。勾选「包含子目录」可扩展到下级目录。上传源可选会话附件，或用 `@docs/report.md` 指定当前会话工作区的单个文件。工作区文件每次都需单独审批。两种方式均限 8 MiB，不覆盖同名文件，并需要服务端支持 OpenSSH `hardlink@openssh.com`。下载返回当前会话的文件附件。
-- 需要核对远端文件时，可用 SHA-256 对比工作区文件，不启用 Shell，也不导出附件。明确要求覆盖时可发起独立审批；只有支持 OpenSSH `posix-rename@openssh.com` 的服务器才会原子替换现有文件。替换结果不确定时先校验，不要直接重试。
-- 启用 Shell 就允许按 SSH 账号现有权限执行命令；SFTP 目录限制不约束 Shell。需要在远端强制隔离文件访问时，应使用操作系统权限或 SFTP chroot。凭据库加密不防御已被攻陷的宿主机或同用户恶意进程。
-- 已在隔离 Profile、低权限回环 OpenSSH 和 Chrome 中验证会话授权、上传下载、在途下载撤销及默认关闭。聊天界面点击附件保存到本机未单独验收。
-
-[完整使用、备份与恢复说明](bundle/README.md) · [安全问题报告](SECURITY.md)
-
-## 打包与测试
-
-在仓库根目录运行：
+从 [GitHub Release v0.7.2](https://github.com/wzxyisme/dsh-ssh-broker/releases/tag/v0.7.2) 下载 `local-dsh-ssh-broker-0.7.2.tgz` 和 `SHA256SUMS`，在下载目录执行：
 
 ```sh
-node --test phase2-vault.test.mjs composer-host.test.mjs
-npm pack ./bundle --ignore-scripts
+sha256sum -c SHA256SUMS
+dsh plugin --profile web add ./local-dsh-ssh-broker-0.7.2.tgz --ignore-scripts
 ```
 
-要运行 Host 指令集成测试，请将 `DSH_TEST_ROOT` 设为 Harness 安装目录，将 `DSH_TEST_SSH_PACKAGE` 设为已安装的 SSH 设备插件目录。未设置时会跳过 Host 集成测试。SFTP 集成测试还需要本机安装 OpenSSH `sftp-server`，使用回环连接和临时目录。
+如果使用其他 Web Profile，把 `web` 替换为对应名称。升级时无需先卸载；完成后重启对应的 DSH 服务，再打开「设置 → SSH 设备」。无需运行依赖的原生构建脚本。不要为未验证的 DSH 版本强制豁免兼容性检查。
 
-安装包应只包含 bundle 的运行代码、资源、使用说明和许可证，不包含测试、日志、凭据或 Profile 数据。项目源码采用 [MIT 许可证](LICENSE)。
+## 快速开始
+
+1. 在「设置 → SSH 设备」创建或解锁该 Profile 的凭据库。
+2. 添加设备。从可信的远端控制台核对 SSH 主机公钥的 SHA-256 指纹，再保存设备。建议使用独立、低权限的 SSH 账号。
+3. 选择当前会话并授权。先选最小范围：仅 Shell、仅文件传输，或两者都开。文件传输要额外指定远端目录；需要访问子目录时再单独开启。
+4. 在会话输入框的「＋」菜单选择 `/ssh-broker`，也可以直接输入。只读命令示例：`/ssh-broker 在获授权的设备上执行 pwd`。结束后可在设置中撤销授权。
+
+| 能力 | 行为 |
+| --- | --- |
+| Shell | 非交互式命令；返回退出状态及有长度上限的 stdout / stderr |
+| SFTP 列目录与下载 | 列出一层授权目录；下载到当前会话附件 |
+| SFTP 上传 | 单文件，不覆盖同名文件；工作区文件每次单独审批 |
+| SFTP 校验与替换 | 只读比较 SHA-256；覆盖只在明确请求、单次审批及服务端支持时执行 |
+
+单文件操作最多 **8 MiB**。普通上传和原子替换分别需要服务端支持 OpenSSH 的 `hardlink@openssh.com`、`posix-rename@openssh.com` 扩展。更多用法、超时结果及备份恢复见[详细操作手册](bundle/README.md)。
+
+## 安全边界
+
+- Shell 以远端 SSH 账号的权限运行，**不受 SFTP 目录范围限制**。需要隔离时由远端配置文件权限或 SFTP chroot，不要依赖插件替代远端权限控制。
+- 凭据库保存在本地并加密，但无法保护已被攻陷的 Host 或同用户恶意进程。不要把密码、私钥、库口令或明文备份放进会话。命令、输出和附件可能保存在会话历史中。
+- 授权会随撤销、库上锁或会话关闭而结束；已经在远端运行的独立进程或提交的文件不保证回滚。遇到提交结果不确定，先校验目标，不要直接重试。
+
+安全问题请按[安全政策](SECURITY.md)私下报告。
+
+## 仓库与开发
+
+| 路径 | 内容 |
+| --- | --- |
+| [`bundle/`](bundle/) | 可安装插件：Host、Web UI、资源和使用手册 |
+| [`tests/`](tests/) | 凭据库与 SSH/SFTP 回归测试 |
+| [`docs/`](docs/) | 开发、发布和市场提交说明 |
+
+参见[开发与发布](docs/development.md)、[变更日志](CHANGELOG.md)和 [MIT 许可证](LICENSE)。
