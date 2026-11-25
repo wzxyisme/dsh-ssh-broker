@@ -381,7 +381,9 @@ export function apply(ctx, config) {
     try {
       operation.done = Promise.resolve().then(() => task(device, auth, controller.signal, grant, start))
       const output = await operation.done
-      const final = controller.signal.aborted ? outcome(controller.signal.reason, start) : output
+      // Shell 超时时保留已接收的诊断输出。撤销或取消时仍返回空结果。
+      const timedOutShell = enabled === canShell && controller.signal.reason === 'timed_out' && output.status === 'timed_out'
+      const final = controller.signal.aborted && !timedOutShell ? outcome(controller.signal.reason, start) : output
       addAudit(final.status, grant.deviceId, final.elapsedMs)
       return final
     } catch (error) {
