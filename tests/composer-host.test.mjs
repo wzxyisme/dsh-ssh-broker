@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { commandName, toolNames } from './bundle/composer.js'
+import { commandName, toolNames } from '../bundle/composer.js'
 
 const { DSH_TEST_ROOT, DSH_TEST_SSH_PACKAGE } = process.env
 const sftpServer = ['/usr/lib/openssh/sftp-server', '/usr/libexec/openssh/sftp-server', '/usr/libexec/sftp-server'].find(existsSync)
@@ -22,7 +22,7 @@ test('SSH composer confines task admission to the live receiving session and sel
   const { Client, Server, utils } = sshRequire('ssh2')
   const hooks = registerHooks({
     resolve(specifier, context, next) {
-      if (context.parentURL?.startsWith(new URL('./bundle/', import.meta.url).href)) {
+      if (context.parentURL?.startsWith(new URL('../bundle/', import.meta.url).href)) {
         if (specifier.startsWith('@deepseek-ai/') || specifier === 'ssh2') {
           const require = specifier === 'ssh2' ? sshRequire : hostRequire
           return next(pathToFileURL(require.resolve(specifier)).href, context)
@@ -32,7 +32,7 @@ test('SSH composer confines task admission to the live receiving session and sel
     },
   })
   let apply
-  try { ({ apply } = await import('./bundle/host.js')) }
+  try { ({ apply } = await import('../bundle/host.js')) }
   finally { hooks.deregister() }
 
   const directory = await mkdtemp(join(tmpdir(), 'ssh-composer-test-'))

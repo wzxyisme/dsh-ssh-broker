@@ -1,8 +1,10 @@
-# SSH 设备
+# SSH Broker · 操作手册
+
+[项目首页（简体中文）](https://github.com/wzxyisme/dsh-ssh-broker#readme) · [English README](https://github.com/wzxyisme/dsh-ssh-broker/blob/main/README.en.md) · [安装包](https://github.com/wzxyisme/dsh-ssh-broker/releases)
 
 在本机 Harness 的「设置 → SSH 设备」创建或解锁凭据库。每台设备保存各自的凭据和权限，可单独变更或删除。
 
-### 核对主机指纹
+## 核对主机指纹
 
 在目标服务器的可信控制台（如云厂商控制台）执行下面的命令。设置页也提供「复制命令」。
 

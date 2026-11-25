@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { Vault } from './bundle/vault.js'
+import { Vault } from '../bundle/vault.js'
 
 const passphrase = 'local fixture passphrase'
 const backupPassphrase = 'separate backup fixture passphrase'
