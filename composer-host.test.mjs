@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { EventEmitter, once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createRequire, registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
@@ -14,6 +16,7 @@ test('SSH composer confines task admission to the live receiving session and sel
 }, async (t) => {
   const hostRequire = createRequire(resolve(DSH_TEST_ROOT, 'package.json'))
   const sshRequire = createRequire(resolve(DSH_TEST_SSH_PACKAGE, 'package.json'))
+  const { Client, Server, utils } = sshRequire('ssh2')
   const hooks = registerHooks({
     resolve(specifier, context, next) {
       if (context.parentURL?.startsWith(new URL('./bundle/', import.meta.url).href)) {
@@ -44,7 +47,7 @@ test('SSH composer confines task admission to the live receiving session and sel
     agents: { get: (id) => agents.get(id), list: () => [...agents.values()] },
     fiber: { entry: { id: 'fixture' } }, profileContext: { dir: directory },
     connection: { browserPeer: peer, admit: () => ({ peer }), fetch: { register: (definition) => { route = definition } } },
-    tools: { register: (tool, options) => { tools.set(tool.name, options); return () => tools.delete(tool.name) } },
+    tools: { register: (tool, options) => { tools.set(tool.name, { tool, ...options }); return () => tools.delete(tool.name) } },
     inject: (deps, fn) => { assert.deepEqual(deps, ['commands']); fn({ commands: { register: (definition) => { command = definition } } }) },
     effect: (fn) => { dispose = fn() }, on: (name, fn) => events.set(name, fn),
   }
@@ -161,6 +164,85 @@ test('SSH composer confines task admission to the live receiving session and sel
       assert.deepEqual((await state()).grants, [])
       await send({ action: 'unlock', passphrase })
       assert.deepEqual(await list(first.id), { devices: [] })
+    })
+
+    await t.test('Shell 超时保留已收到的 stdout、stderr 和截断标记', async (t) => {
+      const hostKey = utils.generateKeyPairSync('ed25519').private
+      const publicKey = utils.parseKey(hostKey).getPublicSSH()
+      const fingerprint = `SHA256:${createHash('sha256').update(publicKey).digest('base64').slice(0, -1)}`
+      const password = 'loopback-fixture-only'
+      const stdout = `stdout marker\n${'x'.repeat(8192)}`
+      const stderr = 'stderr marker\n'
+      const server = new Server({ hostKeys: [hostKey] }, (client) => {
+        client.on('error', () => {})
+        client.on('authentication', (auth) => {
+          if (auth.method === 'password' && auth.username === 'fixture' && auth.password === password) auth.accept()
+          else auth.reject()
+        })
+        client.on('session', (accept) => {
+          accept().once('exec', (acceptExec, rejectExec, { command }) => {
+            if (command !== 'timeout-test') return rejectExec()
+            const stream = acceptExec()
+            stream.write(stdout)
+            stream.stderr.write(stderr)
+            // 保持通道开启，让插件自己的超时结束本次调用。
+          })
+        })
+      })
+      const received = new EventEmitter()
+      const originalExec = Client.prototype.exec
+      t.mock.method(Client.prototype, 'exec', function (command, options, callback) {
+        return originalExec.call(this, command, options, (error, stream) => {
+          callback(error, stream)
+          if (error) return
+          let outBytes = 0
+          let errBytes = 0
+          const check = () => {
+            if (outBytes >= stdout.length && errBytes >= stderr.length) received.emit('complete')
+          }
+          stream.on('data', (chunk) => { outBytes += chunk.length; check() })
+          stream.stderr.on('data', (chunk) => { errBytes += chunk.length; check() })
+        })
+      })
+      const controller = new AbortController()
+      let execution
+      try {
+        const listening = once(server, 'listening')
+        server.listen(0, '127.0.0.1')
+        await listening
+        const { port } = server.address()
+        await send({ action: 'configure', host: '127.0.0.1', port, username: 'fixture', label: 'Shell 超时测试',
+          fingerprint, credential: { kind: 'password', value: password }, confirmFingerprint: true })
+        const device = (await state()).devices.find((device) => device.label === 'Shell 超时测试')
+        await authorize(device.id, first)
+        const session = (await state()).grants.find(({ deviceId }) => deviceId === device.id).id
+        const originalSetTimeout = globalThis.setTimeout
+        let expire
+        // 只手动触发插件的执行超时，SSH 握手和清理仍使用真实计时器。
+        t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+          if (delay === 30_000) expire = () => callback(...args)
+          return originalSetTimeout(callback, delay, ...args)
+        })
+        const delivered = once(received, 'complete', { signal: AbortSignal.timeout(5000) })
+        execution = tools.get(toolNames.exec).tool.execute({ session, command: 'timeout-test' }, { agent: first, signal: controller.signal })
+        await delivered
+        expire()
+        const output = await execution
+        assert.equal(output.status, 'timed_out')
+        assert.equal(output.exitCode, null)
+        assert.equal(output.exitSignal, null)
+        assert.equal(output.stdout.length, 8192)
+        assert.equal(output.stdout, stdout.slice(0, 8192))
+        assert.equal(output.stderr, stderr)
+        assert.equal(output.stdoutTruncated, true)
+        assert.equal(output.stderrTruncated, false)
+      } finally {
+        controller.abort()
+        try { await execution }
+        finally {
+          if (server.address()) await new Promise((resolve) => server.close(resolve))
+        }
+      }
     })
   } finally {
     await dispose?.()
