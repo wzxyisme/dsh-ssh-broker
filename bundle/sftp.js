@@ -10,6 +10,9 @@ const LIST_SCAN_ENTRIES = 1000
 const LIST_READS = 128
 const SFTP_EOF = 1
 const SFTP_NO_SUCH_FILE = 2
+const SFTP_FAILURE = 4
+// SFTP v3 的明确拒绝；无回执和连接错误不能证明服务器没有执行提交。
+const definitiveRejections = new Set([SFTP_NO_SUCH_FILE, 3, SFTP_FAILURE, 5])
 const unsafe = /[\p{Cc}\p{Cf}\p{Cs}\\]/u
 const fail = (code) => { throw sshError(code) }
 const unsupported = (error) => error?.code === 8 || error?.message === 'Server does not support this extended request'
@@ -31,9 +34,19 @@ export function validTransferDirectory(directory) {
 }
 
 function request(sftp, signal, method, ...args) {
+  return requestWithAck(sftp, signal, method, undefined, ...args)
+}
+
+function requestWithAck(sftp, signal, method, onSuccess, ...args) {
   signal?.throwIfAborted()
+  if (sftp.readable === false) return Promise.reject(sshError('transport_error'))
   return new Promise((resolve, reject) => {
-    sftp[method](...args, (error, value) => error ? reject(error) : resolve(value))
+    sftp[method](...args, (error, value) => {
+      if (error) return reject(error)
+      try { onSuccess?.() }
+      catch (cause) { return reject(cause) }
+      resolve(value)
+    })
   })
 }
 
@@ -64,15 +77,16 @@ function parentPath(path) {
   return path.slice(0, Math.max(0, path.lastIndexOf('/')))
 }
 
-export function uploadFile(sftp, signal, directory, name, source) {
-  return stageFile(sftp, signal, directory, name, source)
+export function uploadFile(sftp, signal, directory, name, source, progress, beforeCommit) {
+  return stageFile(sftp, signal, directory, name, source, { progress, beforeCommit })
 }
 
 export function replaceFile(sftp, signal, directory, name, source, previous, commit) {
-  return stageFile(sftp, signal, directory, name, source, { previous, commit })
+  return stageFile(sftp, signal, directory, name, source, { replacement: { previous, commit } })
 }
 
-async function stageFile(sftp, signal, directory, name, { bytes: size, read }, replacement) {
+async function stageFile(sftp, signal, directory, name, { bytes: size, read }, { replacement, progress, beforeCommit }) {
+  if (progress) progress.phase = 'preparing_remote'
   if (!Number.isSafeInteger(size) || size < 0 || size > TRANSFER_BYTES) fail('file_too_large')
   const relativeParent = parentPath(name)
   const parent = await verifyDirectoryPath(sftp, signal, directory, relativeParent)
@@ -89,12 +103,14 @@ async function stageFile(sftp, signal, directory, name, { bytes: size, read }, r
   try {
     handle = await request(sftp, signal, 'open', staging, 'wx', { mode: 0o600 })
     created = true
+    if (progress) progress.phase = 'writing'
     for await (const chunk of read()) {
       if (bytes + chunk.byteLength > size) fail('attachment_changed')
       const data = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
       for (let offset = 0; offset < data.length;) {
         const length = Math.min(CHUNK_BYTES, data.length - offset)
-        await request(sftp, signal, 'write', handle, data, offset, length, bytes)
+        await requestWithAck(sftp, signal, 'write', progress && (() => { progress.acknowledgedBytes += length }),
+          handle, data, offset, length, bytes)
         offset += length
         bytes += length
       }
@@ -132,13 +148,28 @@ async function stageFile(sftp, signal, directory, name, { bytes: size, read }, r
       replacement.commit('confirmed', bytes)
       return bytes
     }
+    progress.phase = 'preparing_commit'
     await verifyDirectoryPath(sftp, signal, directory, relativeParent)
+    beforeCommit()
+    signal.throwIfAborted()
     // SFTP v3 的 rename 在不同实现上覆盖行为不同。OpenSSH hardlink 原子地拒绝同名目标。
-    try { await request(sftp, signal, 'ext_openssh_hardlink', staging, target) }
-    catch (error) {
-      signal.throwIfAborted()
-      if (await lookup(sftp, signal, target)) fail('remote_exists')
-      if (error?.code === 8 || error?.message === 'Server does not support this extended request') fail('upload_unsupported')
+    progress.phase = 'committing'
+    progress.commit = 'pending'
+    try {
+      await requestWithAck(sftp, signal, 'ext_openssh_hardlink', () => {
+        progress.commit = 'confirmed'
+        progress.phase = 'cleanup'
+      }, staging, target)
+    } catch (error) {
+      if (unsupported(error)) {
+        progress.commit = undefined
+        fail('upload_unsupported')
+      }
+      if (definitiveRejections.has(error?.code)) {
+        progress.commit = undefined
+        if (error.code === SFTP_FAILURE && await lookup(sftp, signal, target)) fail('remote_exists')
+        fail('upload_commit_failed')
+      }
       fail('upload_commit_unknown')
     }
     published = true
@@ -147,7 +178,7 @@ async function stageFile(sftp, signal, directory, name, { bytes: size, read }, r
     if (created && !signal.aborted) {
       try {
         await verifyDirectoryPath(sftp, signal, directory, relativeParent)
-        await request(sftp, signal, 'unlink', staging)
+        await requestWithAck(sftp, signal, 'unlink', published ? () => { progress.commit = 'cleaned' } : undefined, staging)
       } catch { if (published && !signal.aborted) fail('uploaded_cleanup_pending') }
     }
   }
