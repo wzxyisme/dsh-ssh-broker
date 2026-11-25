@@ -4,6 +4,8 @@ export const toolNames = Object.freeze({
   list: 'dsh_ssh_broker_list',
   upload: 'dsh_ssh_broker_upload',
   download: 'dsh_ssh_broker_download',
+  verify: 'dsh_ssh_broker_verify',
+  replace: 'dsh_ssh_broker_replace',
 })
 
 const usage = '请在 /ssh-broker 后填写任务。'
@@ -24,7 +26,7 @@ export function composeSshTask(rawInput, choices) {
   if (!choice) return { error: selector ? selectedUnavailable : unavailable }
   const allowedTools = []
   if (choice.shell) allowedTools.push(toolNames.exec)
-  if (choice.transfer) allowedTools.push(toolNames.list, toolNames.upload, toolNames.download)
+  if (choice.transfer) allowedTools.push(toolNames.list, toolNames.upload, toolNames.download, toolNames.verify, toolNames.replace)
   return {
     label: choice.label,
     text: `${text}\n\n[SSH Broker · 本次任务的设备授权]\n只在用户明确请求的范围内使用以下工具执行本次任务。调用时将 session 设置为 ${choice.grantId}。可用工具：${allowedTools.join('、')}。授权失效、权限不足或设备不匹配时，请向用户报告，等待重新授权。`,
