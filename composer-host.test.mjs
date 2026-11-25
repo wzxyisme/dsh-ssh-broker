@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { createRequire, registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -254,6 +254,13 @@ test('SSH composer confines task admission to the live receiving session and sel
       const inbox = join(root, 'inbox')
       const reports = join(inbox, 'reports')
       const outside = join(root, 'outside')
+      const workspace = join(root, 'work')
+      const local = join(workspace, 'docs', 'my report.bin')
+      const binary = Buffer.from([0, 13, 10, 255, 80])
+      await mkdir(join(workspace, 'docs'), { recursive: true })
+      await writeFile(local, binary)
+      await writeFile(join(workspace, 'large.bin'), '')
+      await truncate(join(workspace, 'large.bin'), 8 * 1024 * 1024 + 1)
       await mkdir(reports, { recursive: true })
       await mkdir(join(outside, 'hidden'), { recursive: true })
       await writeFile(join(inbox, 'root.txt'), 'top level')
@@ -261,6 +268,9 @@ test('SSH composer confines task admission to the live receiving session and sel
       await writeFile(join(inbox, '.dsh-sftp-fixture'), 'staging file')
       await symlink(outside, join(inbox, 'linked-dir'))
       await symlink(join(inbox, 'root.txt'), join(inbox, 'linked-file'))
+      await symlink(outside, join(workspace, 'linked-dir'))
+      await symlink(join(inbox, 'root.txt'), join(workspace, 'linked-file'))
+      await link(join(inbox, 'root.txt'), join(workspace, 'hard-linked'))
 
       const { private: hostKey } = utils.generateKeyPairSync('ed25519')
       const fingerprint = `SHA256:${createHash('sha256').update(utils.parseKey(hostKey).getPublicSSH()).digest('base64').slice(0, -1)}`
@@ -293,7 +303,16 @@ test('SSH composer confines task admission to the live receiving session and sel
       const fixture = Buffer.from('attachment data')
       const source = { attachmentId: 'fixture-source', name: 'source.txt', bytes: fixture.length }
       let downloaded
-      first.session = { id: first.id }
+      first.session = { id: first.id, header: { cwd: workspace } }
+      const approvals = []
+      let decision = () => 'allowed-once'
+      const fs = {
+        processPathFromHostPath: (path) => path,
+        resolve: (path, { cwd }) => realpath(resolve(cwd, path)),
+        processPath: (path) => path,
+      }
+      const approval = { request: async (request) => { approvals.push(request); return decision(request) } }
+      ctx.get = (service) => ({ approval, fs })[service]
       ctx.sessionQuery = { observeSession: async () => ({
         inheritedEventCount: 0,
         events: [{ type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'file', attachment: source }] } }],
@@ -324,7 +343,7 @@ test('SSH composer confines task admission to the live receiving session and sel
         const preview = () => ({ action: 'previewDirectory', id: grant.id })
         const revoke = () => send({ action: 'revoke', id: grant.id })
         const run = (name, args = {}, agent = first) => tools.get(toolNames[name]).tool.execute({ session: grant.id, ...args }, {
-          agent, signal: AbortSignal.timeout(5000),
+          agent, signal: AbortSignal.timeout(5000), callId: 'fixture-call',
         })
         const expectEntries = (result, entries) => {
           assert.equal(result.status, 'listed')
@@ -339,6 +358,48 @@ test('SSH composer confines task admission to the live receiving session and sel
         assert.equal((await run('list', { path: 'reports' })).status, 'subdirectories_not_allowed')
         assert.equal((await run('download', { name: 'reports/summary.txt' })).status, 'subdirectories_not_allowed')
         assert.equal((await run('upload', { name: 'reports/new.txt', attachment: source.name })).status, 'subdirectories_not_allowed')
+        if (process.platform === 'linux') {
+          const upload = { name: 'workspace.bin', workspacePath: '@"docs/my report.bin"' }
+          assert.equal((await run('upload', upload, second)).status, 'not_authorized')
+          assert.equal((await run('upload', { ...upload, name: 'reports/workspace.bin' })).status, 'subdirectories_not_allowed')
+          assert.equal((await run('upload', { name: 'workspace.bin' })).status, 'invalid_arguments')
+          assert.equal((await run('upload', { ...upload, attachment: source.name })).status, 'invalid_arguments')
+          for (const workspacePath of [local, `@${local}`, 'docs/../large.bin', 'C:/tmp/doc', '././large.bin', 'docs/', '']) {
+            assert.equal((await run('upload', { ...upload, workspacePath })).status, 'invalid_arguments')
+          }
+          for (const [workspacePath, status] of [
+            ['docs/absent.bin', 'workspace_file_not_found'], ['large.bin', 'file_too_large'],
+            ['linked-dir/hidden/test', 'workspace_not_regular_file'], ['linked-file', 'workspace_not_regular_file'],
+            ['hard-linked', 'workspace_not_regular_file'], ['docs', 'workspace_not_regular_file'],
+          ]) assert.equal((await run('upload', { ...upload, workspacePath })).status, status)
+          ctx.get = (service) => service === 'fs' ? fs : undefined
+          assert.equal((await run('upload', upload)).status, 'approval_unavailable')
+          ctx.get = (service) => service === 'approval' ? approval : { ...fs, processPathFromHostPath: () => undefined }
+          assert.equal((await run('upload', upload)).status, 'workspace_unavailable')
+          ctx.get = (service) => ({ approval, fs })[service]
+          first.session.header.cwd = join(workspace, 'linked-dir')
+          assert.equal((await run('upload', upload)).status, 'workspace_unavailable')
+          first.session.header.cwd = workspace
+          assert.equal(approvals.length, 0)
+          for (const state of ['rejected', 'cancelled', 'unavailable']) {
+            decision = () => state
+            assert.equal((await run('upload', upload)).status, `approval_${state}`)
+          }
+          const question = approvals.at(-1)
+          assert.equal(question.callId, 'fixture-call')
+          assert.equal(question.agent, first)
+          assert.equal(question.toolName, toolNames.upload)
+          assert(question.reason.includes(local))
+          assert(question.reason.includes('fixture@127.0.0.1:'))
+          assert(question.reason.includes(join(inbox, upload.name)))
+          decision = async () => {
+            await writeFile(local, Buffer.alloc(binary.length, 0xff))
+            return 'allowed-once'
+          }
+          assert.equal((await run('upload', upload)).status, 'workspace_file_changed')
+          await writeFile(local, binary)
+          decision = () => 'allowed-once'
+        }
         assert.deepEqual(await send(preview(), 403, 'http://another-origin'), { error: 'forbidden' })
         assert.equal(connections, 0)
         const rootEntries = [{ name: 'reports', type: 'directory' }, { name: 'root.txt', type: 'file' }]
@@ -370,12 +431,38 @@ test('SSH composer confines task admission to the live receiving session and sel
         assert.equal((await run('upload', upload)).status, 'uploaded')
         assert.equal((await run('upload', upload)).status, 'remote_exists')
         assert.deepEqual(await readFile(join(reports, 'new.txt')), fixture)
+        if (process.platform === 'linux') {
+          const upload = { name: 'reports/workspace.bin', workspacePath: '@"docs/my report.bin"' }
+          const previousApprovals = approvals.length
+          const uploaded = await run('upload', upload)
+          assert.equal(uploaded.status, 'uploaded')
+          assert.equal(uploaded.bytes, binary.length)
+          assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
+          assert.equal((await run('upload', upload)).status, 'remote_exists')
+          assert.equal(approvals.length, previousApprovals + 2)
+          assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
+        }
         await Promise.all(Array.from({ length: 101 }, (_, index) => writeFile(join(reports, `entry-${index}`), '')))
         const limited = await run('list', { path: 'reports' })
         assert.equal(limited.status, 'listed')
         assert.equal(limited.entries.length, 100)
         assert.equal(limited.truncated, true)
-        await revoke()
+        if (process.platform === 'linux') {
+          const pending = Promise.withResolvers()
+          const answer = Promise.withResolvers()
+          decision = (request) => { pending.resolve(request); return answer.promise }
+          const before = connections
+          const transfer = run('upload', { name: 'revoked.bin', workspacePath: '@docs/my report.bin' })
+          try {
+            const request = await Promise.race([pending.promise, transfer.then(({ status }) => { throw Error(status) })])
+            assert.equal(request.signal.aborted, false)
+            await revoke()
+            assert.equal(request.signal.aborted, true)
+          } finally { answer.resolve('allowed-once') }
+          assert.equal((await transfer).status, 'revoked')
+          assert.equal(connections, before)
+          assert(!existsSync(join(inbox, 'revoked.bin')))
+        } else await revoke()
       } finally {
         for (const client of clients) client.end()
         for (const { child } of subprocesses) child.stdin.end()

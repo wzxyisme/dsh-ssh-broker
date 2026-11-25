@@ -61,8 +61,8 @@ function parentPath(path) {
   return path.slice(0, Math.max(0, path.lastIndexOf('/')))
 }
 
-export async function uploadFile(sftp, signal, directory, name, attachments, ref) {
-  if (!Number.isSafeInteger(ref.bytes) || ref.bytes < 0 || ref.bytes > TRANSFER_BYTES) fail('file_too_large')
+export async function uploadFile(sftp, signal, directory, name, { bytes: size, read }) {
+  if (!Number.isSafeInteger(size) || size < 0 || size > TRANSFER_BYTES) fail('file_too_large')
   const relativeParent = parentPath(name)
   const parent = await verifyDirectoryPath(sftp, signal, directory, relativeParent)
   const target = posix.join(parent, posix.basename(name))
@@ -75,8 +75,8 @@ export async function uploadFile(sftp, signal, directory, name, attachments, ref
   try {
     handle = await request(sftp, signal, 'open', staging, 'wx', { mode: 0o600 })
     created = true
-    for await (const chunk of attachments.readFileStream(ref, signal)) {
-      if (bytes + chunk.byteLength > ref.bytes) fail('attachment_changed')
+    for await (const chunk of read()) {
+      if (bytes + chunk.byteLength > size) fail('attachment_changed')
       const data = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)
       for (let offset = 0; offset < data.length;) {
         const length = Math.min(CHUNK_BYTES, data.length - offset)
@@ -85,7 +85,7 @@ export async function uploadFile(sftp, signal, directory, name, attachments, ref
         bytes += length
       }
     }
-    if (bytes !== ref.bytes) fail('attachment_changed')
+    if (bytes !== size) fail('attachment_changed')
     await request(sftp, signal, 'close', handle)
     handle = undefined
     await verifyDirectoryPath(sftp, signal, directory, relativeParent)
