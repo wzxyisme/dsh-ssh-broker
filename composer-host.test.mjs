@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter, once } from 'node:events'
 import { existsSync } from 'node:fs'
-import { link, mkdir, mkdtemp, readFile, realpath, rm, symlink, truncate, writeFile } from 'node:fs/promises'
+import { chmod, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, truncate, utimes, writeFile } from 'node:fs/promises'
 import { createRequire, registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -72,7 +72,7 @@ test('SSH composer confines task admission to the live receiving session and sel
     assert.equal(command.name, commandName)
     assert.equal(command.recordInput, false)
     assert.equal(command.input.attachments, true)
-    assert.deepEqual([...tools.keys()], Object.values(toolNames))
+    assert.deepEqual([...tools.keys()].sort(), Object.values(toolNames).sort())
     assert.deepEqual(await list(first.id), { devices: [] })
     assert.throws(() => submit('读取系统信息'), /没有有效的 SSH 授权/)
     await send({ action: 'initialize', passphrase: 'local fixture passphrase' })
@@ -109,6 +109,8 @@ test('SSH composer confines task admission to the live receiving session and sel
     assert.deepEqual(messages[1].content[0], attachment)
     assert.match(messages[1].content[1].text, /dsh_ssh_broker_list/)
     assert.match(messages[1].content[1].text, /dsh_ssh_broker_upload/)
+    assert.match(messages[1].content[1].text, /dsh_ssh_broker_verify/)
+    assert.match(messages[1].content[1].text, /dsh_ssh_broker_replace/)
     assert.doesNotMatch(messages[1].content[1].text, /dsh_ssh_broker_exec|--device|fixture-only-password/)
     await send({ action: 'revoke', id: shellGrant.id })
     await authorize(a, first)
@@ -249,7 +251,7 @@ test('SSH composer confines task admission to the live receiving session and sel
         }
       }
     })
-    await t.test('SFTP 目录预览与子目录授权', { skip: !sftpServer && '需要本机 OpenSSH sftp-server' }, async () => {
+    await t.test('SFTP 目录预览、子目录授权、SHA-256 校验与审批替换', { skip: !sftpServer && '需要本机 OpenSSH sftp-server' }, async () => {
       const root = await realpath(directory)
       const inbox = join(root, 'inbox')
       const reports = join(inbox, 'reports')
@@ -303,6 +305,8 @@ test('SSH composer confines task admission to the live receiving session and sel
       const fixture = Buffer.from('attachment data')
       const source = { attachmentId: 'fixture-source', name: 'source.txt', bytes: fixture.length }
       let downloaded
+      let savedAttachments = 0
+      const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex')
       first.session = { id: first.id, header: { cwd: workspace } }
       const approvals = []
       let decision = () => 'allowed-once'
@@ -321,6 +325,7 @@ test('SSH composer confines task admission to the live receiving session and sel
       ctx.attachments = {
         async *readFileStream(ref) { assert.equal(ref, source); yield fixture },
         async saveFileStream({ data, name }) {
+          savedAttachments++
           const chunks = []
           for await (const chunk of data) chunks.push(chunk)
           downloaded = Buffer.concat(chunks)
@@ -342,8 +347,8 @@ test('SSH composer confines task admission to the live receiving session and sel
         let grant = await createGrant()
         const preview = () => ({ action: 'previewDirectory', id: grant.id })
         const revoke = () => send({ action: 'revoke', id: grant.id })
-        const run = (name, args = {}, agent = first) => tools.get(toolNames[name]).tool.execute({ session: grant.id, ...args }, {
-          agent, signal: AbortSignal.timeout(5000), callId: 'fixture-call',
+        const run = (name, args = {}, agent = first, signal = AbortSignal.timeout(20000)) => tools.get(toolNames[name]).tool.execute({ session: grant.id, ...args }, {
+          agent, signal, callId: 'fixture-call',
         })
         const expectEntries = (result, entries) => {
           assert.equal(result.status, 'listed')
@@ -355,6 +360,20 @@ test('SSH composer confines task admission to the live receiving session and sel
         assert(!tools.get(toolNames.exec).when({ agent: first }))
         assert(!tools.get(toolNames.list).when({ agent: second }))
         assert.equal((await run('list', {}, second)).status, 'not_authorized')
+        const localSource = { workspacePath: '@"docs/my report.bin"' }
+        assert(tools.get(toolNames.verify).when({ agent: first }))
+        assert(tools.get(toolNames.replace).when({ agent: first }))
+        assert(!tools.get(toolNames.verify).when({ agent: second }))
+        assert(!tools.get(toolNames.replace).when({ agent: second }))
+        assert.equal((await run('verify', { ...localSource, name: 'root.txt' }, second)).status, 'not_authorized')
+        assert.equal((await run('replace', { name: 'root.txt', attachment: source.name }, second)).status, 'not_authorized')
+        assert.equal((await run('replace', { name: 'reports/summary.txt', attachment: source.name })).status, 'subdirectories_not_allowed')
+        if (process.platform === 'linux') {
+          assert.equal((await run('verify', { ...localSource, name: 'reports/summary.txt' })).status, 'subdirectories_not_allowed')
+          assert.equal((await run('verify', { ...localSource, name: '../outside/hidden/test' })).status, 'invalid_arguments')
+          assert.equal((await run('verify', { name: 'root.txt', workspacePath: '../outside/hidden/test' })).status, 'invalid_arguments')
+        }
+        assert.equal((await run('replace', { name: '../outside/hidden/test', attachment: source.name })).status, 'invalid_arguments')
         assert.equal((await run('list', { path: 'reports' })).status, 'subdirectories_not_allowed')
         assert.equal((await run('download', { name: 'reports/summary.txt' })).status, 'subdirectories_not_allowed')
         assert.equal((await run('upload', { name: 'reports/new.txt', attachment: source.name })).status, 'subdirectories_not_allowed')
@@ -434,7 +453,51 @@ test('SSH composer confines task admission to the live receiving session and sel
         const upload = { name: 'reports/new.txt', attachment: source.name }
         assert.equal((await run('upload', { ...upload, workspacePath: '' })).status, 'uploaded')
         assert.equal((await run('upload', upload)).status, 'remote_exists')
-        assert.deepEqual(await readFile(join(reports, 'new.txt')), fixture)
+        const replacementPath = join(reports, 'new.txt')
+        assert.deepEqual(await readFile(replacementPath), fixture)
+        const replacement = { ...upload, workspacePath: '' }
+        const earlierApprovals = approvals.length
+        const missingReplacement = join(reports, 'missing.txt')
+        assert.equal((await run('replace', { ...replacement, name: 'reports/missing.txt' })).status, 'remote_not_found')
+        assert.equal((await run('replace', { ...replacement, name: 'linked-file' })).status, 'remote_not_regular_file')
+        assert.equal((await run('replace', { ...replacement, name: 'linked-dir/hidden/new.txt' })).status, 'remote_directory_changed')
+        assert.equal(approvals.length, earlierApprovals)
+        assert(!existsSync(missingReplacement))
+        assert(!existsSync(join(outside, 'hidden', 'new.txt')))
+
+        const mode = 0o751
+        const oldContents = Buffer.alloc(fixture.length, 0x61)
+        const changedContents = Buffer.alloc(fixture.length, 0x62)
+        const fixedTime = new Date('2024-01-01T00:00:00Z')
+        await writeFile(replacementPath, oldContents)
+        await chmod(replacementPath, mode)
+        await utimes(replacementPath, fixedTime, fixedTime)
+        decision = () => 'rejected'
+        assert.equal((await run('replace', replacement)).status, 'approval_rejected')
+        assert.deepEqual(await readFile(replacementPath), oldContents)
+        const replacementQuestion = approvals.at(-1)
+        assert.equal(replacementQuestion.agent, first)
+        assert.equal(replacementQuestion.toolName, toolNames.replace)
+        assert.equal(replacementQuestion.callId, 'fixture-call')
+        assert(replacementQuestion.reason.includes(replacementPath))
+        assert(replacementQuestion.reason.includes(sha256(oldContents)))
+
+        decision = async () => {
+          // SFTP v3 只能看到秒级 mtime；保持大小、权限和 mtime 不变以验证内容哈希确实参加复核。
+          await writeFile(replacementPath, changedContents)
+          await utimes(replacementPath, fixedTime, fixedTime)
+          return 'allowed-once'
+        }
+        assert.equal((await run('replace', replacement)).status, 'remote_file_changed')
+        assert.deepEqual(await readFile(replacementPath), changedContents)
+
+        decision = () => 'allowed-once'
+        const replaced = await run('replace', replacement)
+        assert.equal(replaced.status, 'replaced')
+        assert.equal(replaced.bytes, fixture.length)
+        assert.deepEqual(await readFile(replacementPath), fixture)
+        assert.equal((await stat(replacementPath)).mode & 0o777, mode)
+
         if (process.platform === 'linux') {
           const upload = { name: 'reports/workspace.bin', workspacePath: '@"docs/my report.bin"' }
           const previousApprovals = approvals.length
@@ -444,8 +507,101 @@ test('SSH composer confines task admission to the live receiving session and sel
           assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
           assert.equal((await run('upload', upload)).status, 'remote_exists')
           assert.equal(approvals.length, previousApprovals + 2)
-          assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
+          const workspaceTarget = join(reports, 'workspace.bin')
+          assert.deepEqual(await readFile(workspaceTarget), binary)
+
+          const expectedLocalHash = sha256(binary)
+          const beforeVerify = await stat(workspaceTarget)
+          const verifyApprovals = approvals.length
+          const verifyAttachments = savedAttachments
+          ctx.get = (service) => service === 'fs' ? fs : undefined
+          const matched = await run('verify', upload)
+          assert.equal(matched.status, 'matched')
+          assert.equal(matched.localSha256, expectedLocalHash)
+          assert.equal(matched.remoteSha256, expectedLocalHash)
+          assert.equal(matched.localBytes, binary.length)
+          assert.equal(matched.remoteBytes, binary.length)
+          assert.equal(matched.attachment, undefined)
+          const mismatched = await run('verify', { ...upload, name: replacement.name })
+          assert.equal(mismatched.status, 'mismatched')
+          assert.equal(mismatched.localSha256, expectedLocalHash)
+          assert.equal(mismatched.remoteSha256, sha256(fixture))
+          assert.equal(mismatched.localBytes, binary.length)
+          assert.equal(mismatched.remoteBytes, fixture.length)
+          assert.equal(mismatched.attachment, undefined)
+          const missing = await run('verify', { ...upload, name: 'reports/missing.txt' })
+          assert.equal(missing.status, 'remote_not_found')
+             assert.equal(missing.localSha256, expectedLocalHash)
+           assert.equal(missing.remoteSha256, null)
+          assert(!existsSync(missingReplacement))
+          assert.deepEqual(await readFile(workspaceTarget), binary)
+          assert.deepEqual(await readFile(replacementPath), fixture)
+          const afterVerify = await stat(workspaceTarget)
+          assert.equal(afterVerify.ino, beforeVerify.ino)
+          assert.equal(afterVerify.mtimeMs, beforeVerify.mtimeMs)
+          assert.equal(approvals.length, verifyApprovals)
+          assert.equal(savedAttachments, verifyAttachments)
+          ctx.get = (service) => ({ approval, fs })[service]
+
+          const replacedFromWorkspace = await run('replace', { ...upload, name: replacement.name, attachment: '' })
+          assert.equal(replacedFromWorkspace.status, 'replaced')
+          assert.equal(replacedFromWorkspace.bytes, binary.length)
+          assert.equal(approvals.length, verifyApprovals + 1)
+          assert.deepEqual(await readFile(replacementPath), binary)
+          assert.equal((await stat(replacementPath)).mode & 0o777, mode)
         }
+        const interceptSftp = async (hook, work) => {
+          const original = Client.prototype.sftp
+          Client.prototype.sftp = function (callback) {
+            return original.call(this, (error, sftp) => {
+              if (!error) hook(sftp)
+              callback(error, sftp)
+            })
+          }
+          try { return await work() }
+          finally { Client.prototype.sftp = original }
+        }
+        await writeFile(replacementPath, oldContents)
+        await chmod(replacementPath, 0o4751)
+        const beforeSpecialMode = approvals.length
+        assert.equal((await run('replace', replacement)).status, 'replace_metadata_mismatch')
+        assert.equal(approvals.length, beforeSpecialMode)
+        await chmod(replacementPath, mode)
+        const unsupported = await interceptSftp((sftp) => {
+          sftp.ext_openssh_rename = () => { throw Error('Server does not support this extended request') }
+        }, () => run('replace', replacement))
+        assert.equal(unsupported.status, 'replace_unsupported')
+        assert.deepEqual(await readFile(replacementPath), oldContents)
+        assert.equal((await readdir(reports)).some((name) => name.startsWith('.dsh-sftp-')), false)
+
+        const beforeCommit = new AbortController()
+        let renameAttempted = false
+        const cancelled = await interceptSftp((sftp) => {
+          const write = sftp.write.bind(sftp)
+          sftp.write = (...args) => {
+            const callback = args.pop()
+            return write(...args, (error) => { if (!error) beforeCommit.abort(); callback(error) })
+          }
+          const rename = sftp.ext_openssh_rename.bind(sftp)
+          sftp.ext_openssh_rename = (...args) => { renameAttempted = true; return rename(...args) }
+        }, () => run('replace', replacement, first, beforeCommit.signal))
+        assert.equal(cancelled.status, 'cancelled')
+        assert.equal(renameAttempted, false)
+        assert.deepEqual(await readFile(replacementPath), oldContents)
+
+        const duringCommit = new AbortController()
+        const unknown = await interceptSftp((sftp) => {
+          const rename = sftp.ext_openssh_rename.bind(sftp)
+          sftp.ext_openssh_rename = (from, to, callback) => rename(from, to, (error) => {
+            if (error) return callback(error)
+            // 目标机确实执行了 rename，但模拟 Broker 未收到成功回复即断开。
+            duringCommit.abort()
+            callback(Error('fixture: rename acknowledgement lost'))
+          })
+        }, () => run('replace', replacement, first, duringCommit.signal))
+        assert.equal(unknown.status, 'replace_commit_unknown')
+        assert.deepEqual(await readFile(replacementPath), fixture)
+
         await Promise.all(Array.from({ length: 101 }, (_, index) => writeFile(join(reports, `entry-${index}`), '')))
         const limited = await run('list', { path: 'reports' })
         assert.equal(limited.status, 'listed')

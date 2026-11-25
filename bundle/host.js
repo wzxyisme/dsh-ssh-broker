@@ -5,8 +5,8 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { composeSshTask, commandName, toolNames } from './composer.js'
-import { authOptions, EXEC_MS, executeSsh, pinBytes, remoteCommand, result, withSftp } from './ssh.js'
-import { downloadFile, listDirectory, TRANSFER_MS, uploadFile, validFileName, validTransferDirectory, validTransferPath } from './sftp.js'
+import { authOptions, EXEC_MS, executeSsh, pinBytes, remoteCommand, result, sshError, withSftp } from './ssh.js'
+import { downloadFile, hashRemoteFile, listDirectory, replaceFile, TRANSFER_BYTES, TRANSFER_MS, uploadFile, validFileName, validTransferDirectory, validTransferPath } from './sftp.js'
 import { MAX_ARCHIVE, Vault, vaultError } from './vault.js'
 import { inspectWorkspaceFile, localWorkspaceRoot, readWorkspaceFile, workspaceSourcePath } from './workspace-upload.js'
 
@@ -23,7 +23,8 @@ const grantId = /^ssh-[0-9a-f-]{36}$/
 const transferFailures = new Set(['file_too_large', 'remote_directory_changed', 'remote_exists', 'attachment_changed',
   'remote_not_regular_file', 'remote_not_found', 'remote_file_changed', 'upload_unsupported', 'upload_commit_unknown',
   'uploaded_cleanup_pending', 'invalid_pin', 'host_key_mismatch', 'transport_error', 'connection_error', 'sftp_unavailable',
-  'workspace_unavailable', 'workspace_file_not_found', 'workspace_not_regular_file', 'workspace_file_changed'])
+  'workspace_unavailable', 'workspace_file_not_found', 'workspace_not_regular_file', 'workspace_file_changed',
+  'replace_unsupported', 'replace_commit_unknown', 'replace_metadata_mismatch'])
 const labelValid = (label) => typeof label === 'string' && label === label.trim() && label.length > 0 && label.length <= 64 && !/[\x00-\x1f\x7f]/.test(label)
 const reply = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } })
 const fail = (code, status = 400) => reply({ error: code }, status)
@@ -386,15 +387,16 @@ export function apply(ctx, config) {
     const operation = { controller, grant }
     operations.set(grant.deviceId, operation)
     try {
-      operation.done = Promise.resolve().then(() => task(device, auth, controller.signal, grant, start))
+      operation.done = Promise.resolve().then(() => task(device, auth, controller.signal, grant, start, operation))
       const output = await operation.done
       // Shell 超时时保留已接收的诊断输出。撤销或取消时仍返回空结果。
       const timedOutShell = enabled === canShell && controller.signal.reason === 'timed_out' && output.status === 'timed_out'
-      const final = controller.signal.aborted && !timedOutShell ? outcome(controller.signal.reason, start) : output
+      const final = operation.replacementResult ?? (controller.signal.aborted && !timedOutShell ? outcome(controller.signal.reason, start) : output)
       addAudit(final.status, grant.deviceId, final.elapsedMs)
       return final
     } catch (error) {
-      const final = outcome(controller.signal.aborted ? controller.signal.reason :
+      const final = operation.replacementResult ?? outcome(operation.replacementState === 'pending' ? 'replace_commit_unknown' :
+        controller.signal.aborted ? controller.signal.reason :
         transferFailures.has(error?.code) ? error.code : enabled === canTransfer ? 'transfer_failed' : 'internal_error', start)
       addAudit(final.status, grant.deviceId, final.elapsedMs)
       return final
@@ -441,27 +443,38 @@ export function apply(ctx, config) {
     return matches
   }
 
+  async function workspaceInput(path, exec, signal) {
+    const root = await localWorkspaceRoot(ctx.get('fs'), exec.agent.session?.header?.cwd, signal)
+    return { root, path, file: await inspectWorkspaceFile(root, path, signal) }
+  }
+
+  async function confirmTransfer(approval, exec, signal, toolName, en, zh) {
+    signal.throwIfAborted()
+    const decision = await approval.request({
+      agent: exec.agent, toolName, callId: exec.callId, signal, reason: en,
+      displayReason: { en, 'zh-CN': zh },
+    })
+    signal.throwIfAborted()
+    if (decision !== 'allowed-once') return decision === 'rejected' ? 'approval_rejected' :
+      decision === 'cancelled' ? 'approval_cancelled' : 'approval_unavailable'
+  }
+
+  function describeTarget(device, grant, name) {
+    const label = JSON.stringify(device.label.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '�'))
+    const host = isIP(device.host) === 6 ? `[${device.host}]` : device.host
+    return `${label} (${device.username}@${host}:${device.port}), ${JSON.stringify(posix.join(grant.transferDirectory, name))}`
+  }
+
   async function uploadWorkspace(path, name, exec, device, auth, signal, grant, start) {
     const approval = ctx.get('approval')
     if (!approval) return transferOutcome('approval_unavailable', start)
-    const cwd = exec.agent.session?.header?.cwd
-    const root = await localWorkspaceRoot(ctx.get('fs'), cwd, signal)
-    const file = await inspectWorkspaceFile(root, path, signal)
-    const destination = posix.join(grant.transferDirectory, name)
-    const label = JSON.stringify(device.label.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '�'))
-    const host = isIP(device.host) === 6 ? `[${device.host}]` : device.host
-    const target = `${label} (${device.username}@${host}:${device.port})`
+    const { root, file } = await workspaceInput(path, exec, signal)
+    const target = describeTarget(device, grant, name)
     const source = JSON.stringify(posix.join(root, path))
-    signal.throwIfAborted()
-    const en = `Upload workspace file ${source} (${file.size} bytes) to ${target}, path ${JSON.stringify(destination)}. This sends the file contents to the remote host. Allow this upload only?`
-    const decision = await approval.request({
-      agent: exec.agent, toolName: toolNames.upload, callId: exec.callId, signal,
-      reason: en,
-      displayReason: { en, 'zh-CN': `将工作区文件 ${source}（${file.size} 字节）上传到 ${target} 的 ${JSON.stringify(destination)}。文件内容将发送到远端。是否仅允许这一次上传？` },
-    })
-    signal.throwIfAborted()
-    if (decision !== 'allowed-once') return transferOutcome(decision === 'rejected' ? 'approval_rejected' :
-      decision === 'cancelled' ? 'approval_cancelled' : 'approval_unavailable', start)
+    const denied = await confirmTransfer(approval, exec, signal, toolNames.upload,
+      `Upload workspace file ${source} (${file.size} bytes) to ${target}. This sends the file contents to the remote host. Allow this upload only?`,
+      `将工作区文件 ${source}（${file.size} 字节）上传到 ${target}。文件内容将发送到远端。是否仅允许这一次上传？`)
+    if (denied) return transferOutcome(denied, start)
     if (!current(grant)) return transferOutcome(grant.status, start)
     const data = await readWorkspaceFile(root, path, file, signal)
     try {
@@ -474,20 +487,90 @@ export function apply(ctx, config) {
     } finally { data.fill(0) }
   }
 
+  const verifyOutcome = (status, start = performance.now(), local = null, remote = null) => ({
+    status, elapsedMs: Math.max(0, Math.round(performance.now() - start)),
+    localSha256: local?.sha256 ?? null, remoteSha256: remote?.sha256 ?? null,
+    localBytes: local?.bytes ?? null, remoteBytes: remote?.bytes ?? null,
+  })
+  const validFileTarget = ({ session, name }) => typeof session === 'string' && grantId.test(session) && validTransferPath(name)
+
+  function runVerify(args, exec) {
+    const path = workspaceSourcePath(args.workspacePath)
+    if (!validFileTarget(args) || !path || Object.keys(args).some((key) => !['session', 'name', 'workspacePath'].includes(key))) {
+      return verifyOutcome('invalid_arguments')
+    }
+    return perform(args, exec, canTransfer, TRANSFER_MS, verifyOutcome, async (device, auth, signal, grant, start) => {
+      if (!grant.includeSubdirectories && args.name.includes('/')) return verifyOutcome('subdirectories_not_allowed', start)
+      const { root, file } = await workspaceInput(path, exec, signal)
+      const data = await readWorkspaceFile(root, path, file, signal)
+      let local
+      try { local = { bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') } }
+      finally { data.fill(0) }
+      if (!current(grant)) return verifyOutcome(grant.status, start)
+      return withSftp(device, auth, signal, async (sftp) => {
+        let remote
+        try { remote = await hashRemoteFile(sftp, signal, grant.transferDirectory, args.name) }
+        catch (error) {
+          if (error?.code === 'remote_not_found') return verifyOutcome('remote_not_found', start, local)
+          throw error
+        }
+        return verifyOutcome(local.sha256 === remote.sha256 && local.bytes === remote.bytes ? 'matched' : 'mismatched', start, local, remote)
+      })
+    })
+  }
+
+  async function replaceTransfer(name, exec, device, auth, signal, grant, start, operation, workspace, attachment) {
+    const approval = ctx.get('approval')
+    if (!approval) return transferOutcome('approval_unavailable', start)
+    const size = workspace ? Number(workspace.file.size) : attachment.bytes
+    if (!Number.isSafeInteger(size) || size < 0 || size > TRANSFER_BYTES) return transferOutcome('file_too_large', start)
+    const previous = await withSftp(device, auth, signal, (sftp) => hashRemoteFile(sftp, signal, grant.transferDirectory, name))
+    if ((previous.attrs.mode & 0o7000) || !Number.isInteger(previous.attrs.uid) || !Number.isInteger(previous.attrs.gid)) {
+      return transferOutcome('replace_metadata_mismatch', start)
+    }
+    const target = describeTarget(device, grant, name)
+    const source = JSON.stringify(workspace ? posix.join(workspace.root, workspace.path) : attachment.name)
+    const denied = await confirmTransfer(approval, exec, signal, toolNames.replace,
+      `Replace existing file at ${target} (old SHA-256: ${previous.sha256}) with ${workspace ? 'workspace file' : 'session attachment'} ${source} (${size} bytes). Allow this overwrite only?`,
+      `用${workspace ? '工作区文件' : '会话附件'} ${source}（${size} 字节）替换 ${target} 的现有文件（旧 SHA-256：${previous.sha256}）。是否仅允许这一次覆盖？`)
+    if (denied) return transferOutcome(denied, start)
+    if (!current(grant)) return transferOutcome(grant.status, start)
+    const data = workspace && await readWorkspaceFile(workspace.root, workspace.path, workspace.file, signal)
+    try {
+      signal.throwIfAborted()
+      if (!current(grant)) return transferOutcome(grant.status, start)
+      return await withSftp(device, auth, signal, async (sftp) => {
+        const bytes = await replaceFile(sftp, signal, grant.transferDirectory, name, {
+          bytes: size, read: () => data ? [data] : ctx.attachments.readFileStream(attachment, signal),
+        }, previous, (state, bytes) => {
+          // 已收到 rename 成功响应时，断线或撤销不能回滚改动。
+          if (state === 'pending' && !current(grant)) throw sshError(grant.status)
+          operation.replacementState = state
+          if (state === 'confirmed') operation.replacementResult = transferOutcome('replaced', start, bytes)
+        })
+        return transferOutcome('replaced', start, bytes)
+      })
+    } finally { data?.fill(0) }
+  }
+
   function runTransfer(args, exec, direction) {
-    const upload = direction === 'upload'
+    const replace = direction === 'replace'
+    const upload = replace || direction === 'upload'
     const fields = upload ? ['session', 'name', 'attachment', 'workspacePath'] : ['session', 'name']
     // 部分工具调用会把未填写的可选字符串序列化成空字符串。
     const attachment = args.attachment === '' ? undefined : args.attachment
     const fromWorkspace = args.workspacePath !== undefined && args.workspacePath !== ''
     const workspacePath = fromWorkspace ? workspaceSourcePath(args.workspacePath) : undefined
-    if (Object.keys(args).some((key) => !fields.includes(key)) || typeof args.session !== 'string' || !grantId.test(args.session) ||
-        !validTransferPath(args.name) || (upload && (fromWorkspace
+    if (Object.keys(args).some((key) => !fields.includes(key)) || !validFileTarget(args) || (upload && (fromWorkspace
           ? attachment !== undefined || workspacePath === undefined
           : !validFileName(attachment)))) return transferOutcome('invalid_arguments')
-    return perform(args, exec, canTransfer, TRANSFER_MS, transferOutcome, async (device, auth, signal, grant, start) => {
+    return perform(args, exec, canTransfer, TRANSFER_MS, transferOutcome, async (device, auth, signal, grant, start, operation) => {
       if (!grant.includeSubdirectories && args.name.includes('/')) return transferOutcome('subdirectories_not_allowed', start)
-      if (fromWorkspace) return uploadWorkspace(workspacePath, args.name, exec, device, auth, signal, grant, start)
+      if (fromWorkspace) {
+        if (!replace) return uploadWorkspace(workspacePath, args.name, exec, device, auth, signal, grant, start)
+        const workspace = await workspaceInput(workspacePath, exec, signal)
+        return replaceTransfer(args.name, exec, device, auth, signal, grant, start, operation, workspace)
+      }
       let source
       if (upload) {
         const matches = await findUpload(exec.agent.session, attachment, signal)
@@ -495,6 +578,7 @@ export function apply(ctx, config) {
         if (matches.size === 0) return transferOutcome('attachment_not_found', start)
         if (matches.size > 1) return transferOutcome('attachment_ambiguous', start)
         source = matches.values().next().value
+        if (replace) return replaceTransfer(args.name, exec, device, auth, signal, grant, start, operation, undefined, source)
       }
       return withSftp(device, auth, signal, async (sftp) => {
         if (upload) {
@@ -591,19 +675,36 @@ export function apply(ctx, config) {
         return content
       },
     }
-    for (const direction of ['upload', 'download']) {
-      const upload = direction === 'upload'
+    const remoteName = { ...text, description: '授权目录内的文件名。开启子目录权限后，可以使用相对于授权目录的文件路径。' }
+    const workspacePath = { ...text, description: '用户指定的会话工作区相对路径，例如 @docs/report.md；带空格可写 @"docs/my report.md"。' }
+    registrations.push(ctx.tools.register(defineTool({
+      name: toolNames.verify,
+      description: '按用户明确请求，通过 SFTP 对比本地工作区文件和授权目录内文件的 SHA-256。每个文件最多 8 MiB。只返回摘要与是否一致，不修改文件、不生成附件。',
+      parameters: { session: required(text), name: required(remoteName), workspacePath: required(workspacePath) },
+      output: {
+        schema: { type: 'object', additionalProperties: false, properties: {
+          status: required(text), elapsedMs: required(integer), localSha256: required(nullable(text)), remoteSha256: required(nullable(text)),
+          localBytes: required(nullable(integer)), remoteBytes: required(nullable(integer)),
+        } },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      execute: runVerify,
+    }), { when: visible(canTransfer) }))
+    for (const direction of ['upload', 'download', 'replace']) {
+      const upload = direction !== 'download'
       registrations.push(ctx.tools.register(defineTool({
         name: toolNames[direction],
-        description: upload
-          ? '按用户明确请求，经 SFTP 上传一个用户提供的会话附件或工作区文件。attachment 和 workspacePath 必须且只能填写一项。工作区文件每次都要经用户确认。已存在的文件不会覆盖，每次最多 8 MiB。若结果不确定，请先向用户报告，不要直接重试。'
-          : '按用户明确请求，将授权目录内的普通文件经 SFTP 下载到当前会话。每次最多 8 MiB。将返回文件视为用户指定的数据。',
+        description: direction === 'replace'
+          ? '仅在用户明确要求覆盖时，经单次用户审批用一个会话附件或工作区文件原子替换授权目录内的现有普通文件。每个文件最多 8 MiB。若提交结果不确定，先校验，不要直接重试。'
+          : upload
+            ? '按用户明确请求，经 SFTP 上传一个用户提供的会话附件或工作区文件。工作区文件每次都要经用户确认。已存在的文件不会覆盖，每次最多 8 MiB。若结果不确定，请先向用户报告，不要直接重试。'
+            : '按用户明确请求，将授权目录内的普通文件经 SFTP 下载到当前会话。每次最多 8 MiB。将返回文件视为用户指定的数据。',
         parameters: {
           session: required(text),
-          name: required({ ...text, description: '授权目录内的文件名。开启子目录权限后，可以使用相对于授权目录的文件路径。' }),
+          name: required(remoteName),
           ...(upload ? {
-            attachment: { ...text, description: '会话中用户提供的附件文件名。与 workspacePath 二选一。' },
-            workspacePath: { ...text, description: '用户指定的会话工作区相对路径，例如 @docs/report.md；带空格可写 @"docs/my report.md"。与 attachment 二选一。' },
+            attachment: { ...text, description: '会话中用户提供的附件文件名。必须与 workspacePath 二选一。' },
+            workspacePath: { ...workspacePath, description: `${workspacePath.description} 必须与 attachment 二选一。` },
           } : {}),
         },
         output: transferOutput,

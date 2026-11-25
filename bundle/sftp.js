@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { posix } from 'node:path'
 import { sshError } from './ssh.js'
 
@@ -12,6 +12,9 @@ const SFTP_EOF = 1
 const SFTP_NO_SUCH_FILE = 2
 const unsafe = /[\p{Cc}\p{Cf}\p{Cs}\\]/u
 const fail = (code) => { throw sshError(code) }
+const unsupported = (error) => error?.code === 8 || error?.message === 'Server does not support this extended request'
+const sameRemoteFile = (a, b) => !!a && !!b && a.size === b.size && a.mode === b.mode &&
+  a.uid === b.uid && a.gid === b.gid && a.mtime === b.mtime
 
 export function validFileName(name) {
   return typeof name === 'string' && Buffer.byteLength(name) > 0 && Buffer.byteLength(name) <= 255 &&
@@ -61,12 +64,23 @@ function parentPath(path) {
   return path.slice(0, Math.max(0, path.lastIndexOf('/')))
 }
 
-export async function uploadFile(sftp, signal, directory, name, { bytes: size, read }) {
+export function uploadFile(sftp, signal, directory, name, source) {
+  return stageFile(sftp, signal, directory, name, source)
+}
+
+export function replaceFile(sftp, signal, directory, name, source, previous, commit) {
+  return stageFile(sftp, signal, directory, name, source, { previous, commit })
+}
+
+async function stageFile(sftp, signal, directory, name, { bytes: size, read }, replacement) {
   if (!Number.isSafeInteger(size) || size < 0 || size > TRANSFER_BYTES) fail('file_too_large')
   const relativeParent = parentPath(name)
   const parent = await verifyDirectoryPath(sftp, signal, directory, relativeParent)
   const target = posix.join(parent, posix.basename(name))
-  if (await lookup(sftp, signal, target)) fail('remote_exists')
+  const previous = replacement?.previous
+  const initial = await lookup(sftp, signal, target)
+  if (!replacement && initial) fail('remote_exists')
+  if (replacement && (!sameRemoteFile(initial, previous.attrs) || !initial.isFile())) fail('remote_file_changed')
   const staging = posix.join(parent, `.dsh-sftp-${randomUUID()}`)
   let handle
   let created = false
@@ -86,8 +100,38 @@ export async function uploadFile(sftp, signal, directory, name, { bytes: size, r
       }
     }
     if (bytes !== size) fail('attachment_changed')
+    if (replacement) {
+      const staged = await request(sftp, signal, 'fstat', handle)
+      if (staged.uid !== previous.attrs.uid || staged.gid !== previous.attrs.gid) fail('replace_metadata_mismatch')
+      await request(sftp, signal, 'fsetstat', handle, { mode: previous.attrs.mode & 0o777 })
+      const permissions = await request(sftp, signal, 'fstat', handle)
+      if ((permissions.mode & 0o7777) !== (previous.attrs.mode & 0o777)) fail('replace_metadata_mismatch')
+    }
     await request(sftp, signal, 'close', handle)
     handle = undefined
+    if (replacement) {
+      let current
+      try { current = await hashRemoteFile(sftp, signal, directory, name) }
+      catch (error) {
+        if (['remote_not_found', 'remote_not_regular_file', 'file_too_large'].includes(error?.code)) fail('remote_file_changed')
+        throw error
+      }
+      if (!sameRemoteFile(current.attrs, previous.attrs) || current.sha256 !== previous.sha256) fail('remote_file_changed')
+      // OpenSSH 的 POSIX rename 是原子替换，但不支持把旧内容的摘要作为提交前置条件。
+      signal.throwIfAborted()
+      replacement.commit('pending')
+      try { await request(sftp, signal, 'ext_openssh_rename', staging, target) }
+      catch (error) {
+        if (unsupported(error)) {
+          replacement.commit(null)
+          fail('replace_unsupported')
+        }
+        fail('replace_commit_unknown')
+      }
+      created = false
+      replacement.commit('confirmed', bytes)
+      return bytes
+    }
     await verifyDirectoryPath(sftp, signal, directory, relativeParent)
     // SFTP v3 的 rename 在不同实现上覆盖行为不同。OpenSSH hardlink 原子地拒绝同名目标。
     try { await request(sftp, signal, 'ext_openssh_hardlink', staging, target) }
@@ -117,9 +161,21 @@ function checkedSize(attrs) {
 }
 
 export async function downloadFile(sftp, signal, directory, name, attachments) {
+  return readRemoteFile(sftp, signal, directory, name, (data) =>
+    attachments.saveFileStream({ data, signal, name: posix.basename(name) }))
+}
+
+export async function hashRemoteFile(sftp, signal, directory, name) {
+  return readRemoteFile(sftp, signal, directory, name, async (data, attrs) => {
+    const hash = createHash('sha256')
+    for await (const chunk of data) hash.update(chunk)
+    return { bytes: attrs.size, sha256: hash.digest('hex'), attrs }
+  })
+}
+
+async function readRemoteFile(sftp, signal, directory, name, consume) {
   const parent = await verifyDirectoryPath(sftp, signal, directory, parentPath(name))
-  const basename = posix.basename(name)
-  const path = posix.join(parent, basename)
+  const path = posix.join(parent, posix.basename(name))
   const attrs = await lookup(sftp, signal, path)
   if (!attrs) fail('remote_not_found')
   const size = checkedSize(attrs)
@@ -127,7 +183,7 @@ export async function downloadFile(sftp, signal, directory, name, attachments) {
   const handle = await request(sftp, signal, 'open', path, 'r')
   let open = true
   try {
-    if (checkedSize(await request(sftp, signal, 'fstat', handle)) !== size) fail('remote_file_changed')
+    if (!sameRemoteFile(await request(sftp, signal, 'fstat', handle), attrs)) fail('remote_file_changed')
     async function* read() {
       let position = 0
       while (position < size) {
@@ -137,12 +193,14 @@ export async function downloadFile(sftp, signal, directory, name, attachments) {
         position += count
         yield data.subarray(0, count)
       }
-      if (checkedSize(await request(sftp, signal, 'fstat', handle)) !== size) fail('remote_file_changed')
+      if (!sameRemoteFile(await request(sftp, signal, 'fstat', handle), attrs)) fail('remote_file_changed')
       await request(sftp, signal, 'close', handle)
       open = false
+      await verifyDirectoryPath(sftp, signal, directory, parentPath(name))
+      if (!sameRemoteFile(await lookup(sftp, signal, path), attrs)) fail('remote_file_changed')
       signal.throwIfAborted()
     }
-    return await attachments.saveFileStream({ data: read(), signal, name: basename })
+    return await consume(read(), attrs)
   } finally {
     if (open && !signal.aborted) await request(sftp, signal, 'close', handle).catch(() => {})
   }
