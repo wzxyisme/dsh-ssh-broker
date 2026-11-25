@@ -18,7 +18,7 @@ dsh plugin --profile web add ./local-dsh-ssh-broker-0.5.0.tgz --ignore-scripts
 
 - 从可信渠道核对目标机的 Host Key 指纹，使用专用低权限账号。不要把 SSH 私钥、密码或凭据库口令发给助手。
 - 为当前会话授权后，在 Harness 的「＋」或斜杠菜单选择 `/ssh-broker`，填写任务并发送。只有一台设备获授权时自动使用它，多台时先选设备。自 `0.4.0` 起，模型工具统一使用 `dsh_ssh_broker_` 前缀。
-- 授权绑定设备和会话，有效期内可撤销。只需要传文件时选择「仅文件传输」，并指定远端目录。上传仅接受当前会话中用户提供的附件；下载返回当前会话的文件附件。上传不覆盖同名文件，且需要服务端支持 OpenSSH `hardlink@openssh.com`。
+- 授权绑定设备和会话，有效期内可撤销。选择「仅文件传输」并指定远端目录后，可在设置页按需预览根目录，也可以让助手列出目录。默认只允许传输根目录的直属文件。勾选「包含子目录」可扩展到下级目录。上传仅接受当前会话中用户提供的附件，且需要服务端支持 OpenSSH `hardlink@openssh.com`。同名文件会阻止上传。下载返回当前会话的文件附件。
 - 启用 Shell 就允许按 SSH 账号现有权限执行命令；SFTP 目录限制不约束 Shell。需要在远端强制隔离文件访问时，应使用操作系统权限或 SFTP chroot。凭据库加密不防御已被攻陷的宿主机或同用户恶意进程。
 - 已在隔离 Profile、低权限回环 OpenSSH 和 Chrome 中验证会话授权、上传下载、在途下载撤销及默认关闭。聊天界面点击附件保存到本机未单独验收。
 
@@ -33,6 +33,6 @@ node --test phase2-vault.test.mjs composer-host.test.mjs
 npm pack ./bundle --ignore-scripts
 ```
 
-要运行 Host 指令集成测试，请将 `DSH_TEST_ROOT` 设为 Harness 安装目录，将 `DSH_TEST_SSH_PACKAGE` 设为已安装的 SSH 设备插件目录。未设置时会跳过该项。
+要运行 Host 指令集成测试，请将 `DSH_TEST_ROOT` 设为 Harness 安装目录，将 `DSH_TEST_SSH_PACKAGE` 设为已安装的 SSH 设备插件目录。未设置时会跳过 Host 集成测试。SFTP 集成测试还需要本机安装 OpenSSH `sftp-server`，使用回环连接和临时目录。
 
 安装包应只包含 bundle 的运行代码、资源、使用说明和许可证，不包含测试、日志、凭据或 Profile 数据。项目源码采用 [MIT 许可证](LICENSE)。

@@ -43,11 +43,25 @@ window.__ModuleLoader__.load({
       grantMode: ['Allowed operations', '允许的操作'], shellOnly: ['Shell only (file transfer off)', '仅 Shell（文件传输关闭）'],
       transferOnly: ['File transfer only', '仅文件传输'], shellAndTransfer: ['Shell and file transfer', 'Shell 和文件传输'],
       transferDirectory: ['Remote directory', '远端目录'],
-      transferHelp: ['Use an absolute directory without symlinks, such as /home/ssh-user/inbox. Transfers are limited to files directly inside this directory, up to 8 MiB per file.', '输入无符号链接的绝对目录，例如 /home/ssh-user/inbox。只能传输该目录下的文件，每个文件最多 8 MiB。'],
+      transferHelp: ['Use an absolute directory without symlinks, such as /home/ssh-user/inbox. Each file can be up to 8 MiB.', '请输入无符号链接的绝对目录，例如 /home/ssh-user/inbox。每个文件最多 8 MiB。'],
+      includeSubdirectories: ['Include subdirectories', '包含子目录'],
+      transferScope: ['Directory scope', '目录范围'],
+      directChildren: ['Top level only', '仅直属文件'],
+      previewDirectory: ['Preview directory', '预览目录'], closePreview: ['Close preview', '关闭预览'],
+      directoryLoading: ['Reading the remote directory…', '正在读取远端目录…'],
+      directoryLoaded: ['Entries loaded: {count}.', '已读取 {count} 项。'],
+      directoryEmpty: ['No files or subdirectories available to display.', '没有可显示的文件或子目录。'],
+      directoryTruncated: ['This listing is incomplete because the directory has too many entries.', '目录条目较多，此处仅显示部分结果。'],
+      directoryFailed: ['Could not list the remote directory.', '无法读取远端目录。'],
+      not_authorized: ['This conversation no longer has file transfer access.', '此会话当前没有文件传输权限。'],
+      remote_directory_changed: ['The remote directory is unavailable or its path has changed.', '远端目录不可用或路径已变更。'],
+      host_key_mismatch: ['The SSH host key no longer matches the saved fingerprint.', 'SSH 主机密钥与已保存的指纹不匹配。'],
+      timed_out: ['The remote operation timed out.', '远端操作超时。'],
       invalid_transfer_directory: ['Enter an absolute directory other than /. Omit the trailing slash and dot segments.', '请输入非根目录的绝对路径，去掉末尾斜杠和 .、.. 路径段。'],
       grant: ['Grant access', '授予权限'], revoke: ['Revoke access', '撤销权限'], access: ['Authorizations', '会话授权'], audit: ['Recent activity', '近期活动'], refresh: ['Refresh', '刷新'],
       active: ['Active', '生效中'], revoked: ['Revoked', '已撤销'], expired: ['Expired', '已到期'], session_closed: ['Conversation closed', '会话已关闭'],
       device_changed: ['Device changed', '设备已变更'], credential_changed: ['Credential changed', '凭据已变更'], unloaded: ['Plugin unloaded', '插件已卸载'],
+      listed: ['Directory listed', '已读取目录'],
       granted: ['Access granted', '已授予权限'], device_saved: ['Device saved', '设备已保存'], device_deleted: ['Device deleted', '设备已删除'],
       device_migrated: ['Device migrated', '设备已迁移'], legacy_cleaned: ['Old credential removed', '旧凭据已清理'], vault_restored: ['Vault restored', '凭据库已恢复'],
       statusUnknown: ['Status is unavailable. An existing authorization may still be active.', '暂时无法确认状态。已有授权可能仍然有效。'],
@@ -93,6 +107,7 @@ window.__ModuleLoader__.load({
       .dsw-ssh-panel .ssh-divider { border-top: 1px solid var(--dsw-alias-border-l1); padding-top: 12px; }
       .dsw-ssh-panel :is(.ssh-muted, .ssh-field) { color: var(--dsw-alias-label-secondary); font-size: 12px; overflow-wrap: anywhere; }
       .dsw-ssh-panel .ssh-copy { min-width: 0; overflow-wrap: anywhere; }
+      .dsw-ssh-panel .ssh-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
       .dsw-ssh-panel .ssh-field { gap: 5px; }
       .dsw-ssh-panel .ssh-control {
         box-sizing: border-box; width: 100%; min-width: 0; min-height: 36px; padding: 7px 10px;
@@ -153,7 +168,7 @@ window.__ModuleLoader__.load({
     const input = (name, props = {}) => h('input', { name, autoComplete: 'off', className: props.type === 'checkbox' ? undefined : 'ssh-control', ...props })
     const selectField = (props, ...children) => h('select', { className: 'ssh-control', ...props }, ...children)
     const field = (label, control) => h('label', { className: 'ssh-field' }, h('span', null, label), control)
-    const check = (name, label) => h('label', { className: 'ssh-check' }, input(name, { required: true, type: 'checkbox' }), h('span', null, label))
+    const check = (name, label, required = true) => h('label', { className: 'ssh-check' }, input(name, { required, type: 'checkbox' }), h('span', null, label))
     const button = (label, { variant, ...props } = {}) => h('button', { type: 'button', className: `ssh-action${variant ? ` ssh-${variant}` : ''}`, ...props }, label)
     const submit = (label, disabled, variant = 'primary') => button(label, { type: 'submit', disabled, variant })
     const actions = (...children) => h('div', { className: 'ssh-actions' }, ...children)
@@ -163,10 +178,10 @@ window.__ModuleLoader__.load({
     const choose = (id, label) => h('option', { key: id, value: id }, label)
     const describe = (device) => `${device.username}@${device.host}:${device.port}`
 
-    async function call(body, signal) {
+    async function call(body, signal, timeoutMs = 10_000) {
       const response = await fetch('api/dsh-ssh-broker', {
         method: 'POST', credentials: 'same-origin', cache: 'no-store', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]),
+        body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
       })
       const data = await response.json()
       if (!response.ok) throw Error(Object.hasOwn(labels, data.error) ? data.error : 'unavailable')
@@ -240,6 +255,59 @@ window.__ModuleLoader__.load({
         editing && h('form', { className: 'ssh-stack ssh-divider', onSubmit: submitForm((data) => void mutate({
           action: 'delete', id, revision, confirm: data.has('delete'),
         }, closeEditor)) }, check('delete', t('checkDelete')), actions(submit(t('delete'), disabled, 'danger'))))
+    }
+
+    function DirectoryPreview({ t, grant, disabled }) {
+      const [preview, setPreview] = useState(null)
+      const request = useRef(null)
+      useEffect(() => () => request.current?.abort(), [])
+
+      async function toggle() {
+        if (preview) {
+          request.current?.abort()
+          setPreview(null)
+          return
+        }
+        const controller = new AbortController()
+        request.current = controller
+        setPreview({ status: 'directoryLoading' })
+        try {
+          const output = await call({ action: 'previewDirectory', id: grant.id }, controller.signal, 15_000)
+          if (!controller.signal.aborted) setPreview(output)
+        } catch (cause) {
+          if (!controller.signal.aborted) {
+            const status = cause.name === 'TimeoutError' ? 'timed_out' : cause.message
+            setPreview({ status: Object.hasOwn(labels, status) ? status : 'directoryFailed' })
+          }
+        } finally {
+          if (request.current === controller) request.current = null
+        }
+      }
+
+      const panelId = `ssh-preview-${grant.id}`
+      const label = t(preview ? 'closePreview' : 'previewDirectory')
+      const listed = preview?.status === 'listed'
+      const loading = preview?.status === 'directoryLoading'
+      let announcement = ''
+      if (loading) announcement = t('directoryLoading')
+      if (listed) {
+        announcement = preview.entries.length ? t('directoryLoaded').replace('{count}', preview.entries.length) : t('directoryEmpty')
+        if (preview.truncated) announcement += ` ${t('directoryTruncated')}`
+      }
+      return h('div', { className: 'ssh-group' },
+        h('div', null, button(label, {
+          'aria-label': `${label} · ${grant.deviceLabel}`, 'aria-expanded': Boolean(preview),
+          'aria-controls': preview ? panelId : undefined, disabled: !preview && (disabled || grant.busy),
+          onClick: () => void toggle(),
+        }), h('span', { className: 'ssh-sr-only', role: 'status' }, announcement)),
+        preview && h('div', { id: panelId, className: 'ssh-inset ssh-group ssh-copy' },
+          loading ? muted(t('directoryLoading')) :
+            !listed ? h('p', { className: 'ssh-error', role: 'alert' }, t(Object.hasOwn(labels, preview.status) ? preview.status : 'directoryFailed')) :
+              h(ReactFragment, null,
+                preview.entries.length ? h('ul', { className: 'ssh-list ssh-mono', 'aria-label': t('previewDirectory') },
+                  preview.entries.map(({ name, type }) => h('li', { key: name }, h('bdi', null, type === 'directory' ? `${name}/` : name)))) :
+                  muted(t('directoryEmpty')),
+                preview.truncated && muted(t('directoryTruncated')))))
     }
 
     function Panel({ t, useSessions }) {
@@ -321,7 +389,7 @@ window.__ModuleLoader__.load({
           const node = form.elements.namedItem(name)
           if (node) node.value = ''
         }
-        for (const node of form.querySelectorAll('input[type="checkbox"]')) node.checked = false
+        for (const node of form.querySelectorAll('input[type="checkbox"][required]')) node.checked = false
         listener(data)
       }
       const disabled = busy || unknown || !view || view.busy
@@ -427,7 +495,7 @@ window.__ModuleLoader__.load({
         const payload = {
           action: 'grant', deviceId: device.id, agentId, duration,
           shell: grantMode !== 'transferOnly', transferDirectory: grantMode === 'shellOnly' ? undefined : data.get('transferDirectory'),
-          confirm: true,
+          includeSubdirectories: grantMode !== 'shellOnly' && data.has('includeSubdirectories'), confirm: true,
         }
         if (duration === 'session') {
           setNotice(null)
@@ -452,7 +520,8 @@ window.__ModuleLoader__.load({
           duration === 'timed' && field(t('ttl'), input('ttl', { type: 'number', min: 1, max: 900, required: true, defaultValue: 300 }))),
         grantMode !== 'shellOnly' && h('div', { className: 'ssh-group' },
           field(t('transferDirectory'), input('transferDirectory', { required: true, maxLength: 1024, spellCheck: false, 'aria-describedby': 'ssh-broker-transfer-help' })),
-          muted(t('transferHelp'), { id: 'ssh-broker-transfer-help' })),
+          muted(t('transferHelp'), { id: 'ssh-broker-transfer-help' }),
+          check('includeSubdirectories', t('includeSubdirectories'), false)),
         check('grant', t('confirmGrant')), actions(button(t(duration === 'session' ? 'reviewSessionGrant' : 'grant'), {
           type: 'submit', variant: 'primary', ref: grantSubmit, disabled,
         })))
@@ -463,7 +532,8 @@ window.__ModuleLoader__.load({
           h('dt', null, t('session')), h('dd', null, sessionLabel(grantReview.payload.agentId)),
           h('dt', null, t('grantMode')), h('dd', null, t(grantReview.mode)),
           grantReview.payload.transferDirectory && h(ReactFragment, null,
-            h('dt', null, t('transferDirectory')), h('dd', null, h('code', null, grantReview.payload.transferDirectory))),
+            h('dt', null, t('transferDirectory')), h('dd', null, h('code', null, grantReview.payload.transferDirectory)),
+            h('dt', null, t('transferScope')), h('dd', null, t(grantReview.payload.includeSubdirectories ? 'includeSubdirectories' : 'directChildren'))),
           h('dt', null, t('duration')), h('dd', null, t('sessionDuration'))),
         muted(t('sessionGrantHelp')), muted(t('sessionGrantEnd')),
         !reviewCurrent && h('p', { className: 'ssh-warn', role: 'status' }, t('sessionGrantChanged')),
@@ -478,17 +548,20 @@ window.__ModuleLoader__.load({
       const accessCard = h('section', { className: 'ssh-card ssh-stack' },
         h('h2', null, t('access')), muted(t('note')), feedback('access'),
         grants.length > 0 && h('ul', { className: 'ssh-list' }, ...grants.filter((grant) => !unknown || grant.status === 'active').map((grant) => h('li', {
-          key: grant.id, className: 'ssh-row ssh-divider',
-        }, h('div', { className: 'ssh-copy' },
-          h('h3', null, grant.deviceLabel), muted(sessionLabel(grant.agentId)),
-          badge(unknown ? t('lastKnown') : actionLabel(grant.status), !unknown && grant.status === 'active'),
-          !unknown && muted(h(ReactFragment, null, t(grant.transferDirectory ? (grant.shell ? 'shellAndTransfer' : 'transferOnly') : 'shellOnly'),
-            grant.transferDirectory && h('code', null, ` · ${grant.transferDirectory}`))),
-          !unknown && grant.status === 'active' && h('p', null, h('code', null, grant.id), ` · ${grant.duration === 'session' ? t('sessionDuration') : `${Math.ceil(grant.remainingMs / 1000)} s`}`)),
-        grant.status === 'active' && button(t('revoke'), {
-          'aria-label': `${t('revoke')} · ${grant.deviceLabel} · ${sessionLabel(grant.agentId)}`,
-          onClick: () => void mutate({ action: 'revoke', id: grant.id }), disabled: busy,
-        })))),
+          key: grant.id, className: 'ssh-group ssh-divider',
+        }, h('div', { className: 'ssh-row' },
+          h('div', { className: 'ssh-copy' },
+            h('h3', null, grant.deviceLabel), muted(sessionLabel(grant.agentId)),
+            badge(unknown ? t('lastKnown') : actionLabel(grant.status), !unknown && grant.status === 'active'),
+            !unknown && muted(h(ReactFragment, null, t(grant.transferDirectory ? (grant.shell ? 'shellAndTransfer' : 'transferOnly') : 'shellOnly'),
+              grant.transferDirectory && h(ReactFragment, null, h('code', null, ` · ${grant.transferDirectory}`),
+                ` · ${t(grant.includeSubdirectories ? 'includeSubdirectories' : 'directChildren')}`))),
+            !unknown && grant.status === 'active' && h('p', null, h('code', null, grant.id), ` · ${grant.duration === 'session' ? t('sessionDuration') : `${Math.ceil(grant.remainingMs / 1000)} s`}`)),
+          grant.status === 'active' && button(t('revoke'), {
+            'aria-label': `${t('revoke')} · ${grant.deviceLabel} · ${sessionLabel(grant.agentId)}`,
+            onClick: () => void mutate({ action: 'revoke', id: grant.id }), disabled: busy,
+          })),
+        !unknown && unlocked && grant.status === 'active' && grant.transferDirectory && h(DirectoryPreview, { t, grant, disabled })))),
         unlocked && (canShowGrantForm ? h(ReactFragment, null, grantForm, review) : muted(t(verified.length ? 'noSessions' : 'noVerifiedDevices'))))
       const backupCard = h('details', { className: 'ssh-card' }, h('summary', null, t('backupTools')),
         h('div', { className: 'ssh-stack' },
