@@ -73,6 +73,15 @@ test('SSH composer confines task admission to the live receiving session and sel
     assert.equal(command.recordInput, false)
     assert.equal(command.input.attachments, true)
     assert.deepEqual([...tools.keys()].sort(), Object.values(toolNames).sort())
+    for (const { tool } of tools.values()) {
+      assert.doesNotMatch(tool.description, /\p{Script=Han}/u)
+      for (const { description } of Object.values(tool.parameters.properties)) {
+        assert(description)
+        assert.doesNotMatch(description, /\p{Script=Han}/u)
+      }
+    }
+    assert.match(tools.get(toolNames.exec).tool.parameters.properties.workdir.description, /Absolute.*empty string/)
+    assert.match(tools.get(toolNames.upload).tool.parameters.properties.attachment.description, /exactly one of attachment or workspacePath/)
     assert.deepEqual(await list(first.id), { devices: [] })
     assert.throws(() => submit('读取系统信息'), /没有有效的 SSH 授权/)
     await send({ action: 'initialize', passphrase: 'local fixture passphrase' })
@@ -172,7 +181,7 @@ test('SSH composer confines task admission to the live receiving session and sel
       assert.deepEqual(await list(first.id), { devices: [] })
     })
 
-    await t.test('Shell 超时保留已收到的 stdout、stderr 和截断标记', async (t) => {
+    await t.test('Shell 工作目录校验与超时输出', async (t) => {
       const hostKey = utils.generateKeyPairSync('ed25519').private
       const publicKey = utils.parseKey(hostKey).getPublicSSH()
       const fingerprint = `SHA256:${createHash('sha256').update(publicKey).digest('base64').slice(0, -1)}`
@@ -187,6 +196,19 @@ test('SSH composer confines task admission to the live receiving session and sel
         })
         client.on('session', (accept) => {
           accept().once('exec', (acceptExec, rejectExec, { command }) => {
+            if (command === 'pwd' || command === "cd '/tmp/my dir' || exit 125\npwd") {
+              const stream = acceptExec()
+              stream.exit(0)
+              stream.end(command === 'pwd' ? '/home/fixture\n' : '/tmp/my dir\n')
+              return
+            }
+            if (command === "cd '/missing-dir' || exit 125\npwd") {
+              const stream = acceptExec()
+              stream.stderr.write('cd: no such directory\n')
+              stream.exit(125)
+              stream.end()
+              return
+            }
             if (command !== 'timeout-test') return rejectExec()
             const stream = acceptExec()
             stream.write(stdout)
@@ -222,6 +244,24 @@ test('SSH composer confines task admission to the live receiving session and sel
         const device = (await state()).devices.find((device) => device.label === 'Shell 超时测试')
         await authorize(device.id, first)
         const session = (await state()).grants.find(({ deviceId }) => deviceId === device.id).id
+        const runShell = (args) => tools.get(toolNames.exec).tool.execute({ session, command: 'pwd', ...args }, {
+          agent: first, signal: AbortSignal.timeout(5000),
+        })
+        for (const [args, cwd] of [[{}, '/home/fixture'], [{ workdir: '' }, '/home/fixture'], [{ workdir: '/tmp/my dir' }, '/tmp/my dir']]) {
+          const output = await runShell(args)
+          assert.equal(output.status, 'exited')
+          assert.equal(output.exitCode, 0)
+          assert.equal(output.stdout, `${cwd}\n`)
+        }
+        for (const workdir of ['.', '/bad\0dir', `/${'你'.repeat(342)}`]) {
+          assert.equal((await runShell({ workdir })).status, 'invalid_workdir')
+        }
+        assert.equal((await runShell({ command: ' ' })).status, 'invalid_command')
+        assert.equal((await runShell({ session: 'bad-id' })).status, 'invalid_arguments')
+        const missing = await runShell({ workdir: '/missing-dir' })
+        assert.equal(missing.status, 'exited')
+        assert.equal(missing.exitCode, 125)
+        assert.match(missing.stderr, /no such directory/)
         const originalSetTimeout = globalThis.setTimeout
         let expire
         // 只手动触发插件的执行超时，SSH 握手和清理仍使用真实计时器。
@@ -251,7 +291,7 @@ test('SSH composer confines task admission to the live receiving session and sel
         }
       }
     })
-    await t.test('SFTP 目录预览、子目录授权、SHA-256 校验与审批替换', { skip: !sftpServer && '需要本机 OpenSSH sftp-server' }, async () => {
+    await t.test('SFTP 目录预览、子目录授权、SHA-256 校验与审批替换', { skip: !sftpServer && '需要本机 OpenSSH sftp-server' }, async (t) => {
       const root = await realpath(directory)
       const inbox = join(root, 'inbox')
       const reports = join(inbox, 'reports')
@@ -504,6 +544,8 @@ test('SSH composer confines task admission to the live receiving session and sel
           const uploaded = await run('upload', { ...upload, attachment: '' })
           assert.equal(uploaded.status, 'uploaded')
           assert.equal(uploaded.bytes, binary.length)
+          assert.equal(uploaded.phase, 'cleanup')
+          assert.equal(uploaded.acknowledgedBytes, binary.length)
           assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
           assert.equal((await run('upload', upload)).status, 'remote_exists')
           assert.equal(approvals.length, previousApprovals + 2)
@@ -560,6 +602,112 @@ test('SSH composer confines task admission to the live receiving session and sel
           }
           try { return await work() }
           finally { Client.prototype.sftp = original }
+        }
+        const deadlines = new Map()
+        const originalSetTimeout = globalThis.setTimeout
+        const originalClearTimeout = globalThis.clearTimeout
+        const setMock = t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+          const timer = originalSetTimeout(callback, delay, ...args)
+          if (delay === 60_000 || delay === 120_000) deadlines.set(timer, { delay, fire: () => callback(...args) })
+          return timer
+        })
+        const clearMock = t.mock.method(globalThis, 'clearTimeout', (timer) => {
+          deadlines.delete(timer)
+          return originalClearTimeout(timer)
+        })
+        const activeDeadline = (delay) => {
+          assert.equal(deadlines.size, 1)
+          const [timer, deadline] = deadlines.entries().next().value
+          assert.equal(deadline.delay, delay)
+          return { timer, fire: deadline.fire }
+        }
+        const uploadSummary = ({ status, phase, bytes, acknowledgedBytes }) => [status, phase, bytes, acknowledgedBytes]
+        const attachmentUpload = (filename) => run('upload', { name: `reports/${filename}`, attachment: source.name })
+        try {
+          if (process.platform === 'linux') {
+            const before = connections
+            let approvalTimer
+            decision = ({ signal }) => new Promise((resolve) => {
+              signal.addEventListener('abort', () => resolve('cancelled'), { once: true })
+              approvalTimer = activeDeadline(120_000).timer
+              activeDeadline(120_000).fire()
+            })
+            const input = { name: 'reports/approval-timeout.bin', workspacePath: '@"docs/my report.bin"' }
+            assert.deepEqual(uploadSummary(await run('upload', input)), ['approval_timed_out', 'approval', null, 0])
+            assert.equal(connections, before)
+            assert(!existsSync(join(inbox, input.name)))
+            assert.equal(deadlines.size, 0)
+
+            let transferTimer
+            decision = () => {
+              const timer = activeDeadline(120_000).timer
+              assert.notEqual(timer, approvalTimer)
+              approvalTimer = timer
+              return 'allowed-once'
+            }
+            const uploaded = await interceptSftp(() => {
+              transferTimer = activeDeadline(60_000).timer
+            }, () => run('upload', { ...input, name: 'reports/after-approval.bin' }))
+            assert(transferTimer)
+            assert.notEqual(transferTimer, approvalTimer)
+            assert.deepEqual(uploadSummary(uploaded), ['uploaded', 'cleanup', binary.length, binary.length])
+            decision = () => 'allowed-once'
+          }
+
+          const writingTimeout = await interceptSftp((sftp) => {
+            const write = sftp.write.bind(sftp)
+            sftp.write = (...args) => {
+              const callback = args.pop()
+              return write(...args, (error) => {
+                callback(error)
+                if (!error) activeDeadline(60_000).fire()
+              })
+            }
+          }, () => attachmentUpload('writing-timeout.txt'))
+          assert.deepEqual(uploadSummary(writingTimeout), ['timed_out', 'writing', null, fixture.length])
+          assert(!existsSync(join(reports, 'writing-timeout.txt')))
+
+          for (const timeout of [false, true]) {
+            const filename = `unconfirmed-${timeout}.txt`
+            const unknown = await interceptSftp((sftp) => {
+              const hardlink = sftp.ext_openssh_hardlink.bind(sftp)
+              sftp.ext_openssh_hardlink = (from, to, callback) => hardlink(from, to, (error) => {
+                if (error) return callback(error)
+                // 服务端已发布文件，但 Broker 没有收到成功回执。
+                if (timeout) activeDeadline(60_000).fire()
+                callback(Error('fixture: hardlink acknowledgement lost'))
+              })
+            }, () => attachmentUpload(filename))
+            assert.deepEqual(uploadSummary(unknown), ['upload_commit_unknown', 'committing', null, fixture.length])
+            assert.deepEqual(await readFile(join(reports, filename)), fixture)
+          }
+
+          const cleanupTimeout = await interceptSftp((sftp) => {
+            sftp.unlink = (_path, callback) => {
+              activeDeadline(60_000).fire()
+              callback(Error('fixture: unlink not acknowledged'))
+            }
+          }, () => attachmentUpload('cleanup-timeout.txt'))
+          assert.deepEqual(uploadSummary(cleanupTimeout), ['uploaded_cleanup_pending', 'cleanup', fixture.length, fixture.length])
+          assert.deepEqual(await readFile(join(reports, 'cleanup-timeout.txt')), fixture)
+
+          const raced = await interceptSftp((sftp) => {
+            const hardlink = sftp.ext_openssh_hardlink.bind(sftp)
+            sftp.ext_openssh_hardlink = (from, to, callback) => {
+              writeFile(to, 'competing file', { flag: 'wx' }).then(() => hardlink(from, to, callback), callback)
+            }
+          }, () => attachmentUpload('raced.txt'))
+          assert.deepEqual(uploadSummary(raced), ['remote_exists', 'committing', null, fixture.length])
+          assert.equal(await readFile(join(reports, 'raced.txt'), 'utf8'), 'competing file')
+          assert.equal(deadlines.size, 0)
+        } finally {
+          setMock.mock.restore()
+          clearMock.mock.restore()
+          decision = () => 'allowed-once'
+          // 前提交超时或清理未确认的样例可能留下临时文件，后续替换用独立的清理断言。
+          for (const name of await readdir(reports)) {
+            if (name.startsWith('.dsh-sftp-')) await rm(join(reports, name))
+          }
         }
         await writeFile(replacementPath, oldContents)
         await chmod(replacementPath, 0o4751)
