@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute, join, posix } from 'node:path'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -8,6 +8,7 @@ import { composeSshTask, commandName, toolNames } from './composer.js'
 import { authOptions, EXEC_MS, executeSsh, pinBytes, remoteCommand, result, withSftp } from './ssh.js'
 import { downloadFile, listDirectory, TRANSFER_MS, uploadFile, validFileName, validTransferDirectory, validTransferPath } from './sftp.js'
 import { MAX_ARCHIVE, Vault, vaultError } from './vault.js'
+import { inspectWorkspaceFile, localWorkspaceRoot, readWorkspaceFile, workspaceSourcePath } from './workspace-upload.js'
 
 export const inject = ['agents', 'credentials', 'tools', 'connection', 'configEditor', 'profileContext', 'attachments', 'sessionQuery']
 const route = '/api/dsh-ssh-broker'
@@ -21,7 +22,8 @@ const revisionId = /^[0-9a-f-]{36}$/
 const grantId = /^ssh-[0-9a-f-]{36}$/
 const transferFailures = new Set(['file_too_large', 'remote_directory_changed', 'remote_exists', 'attachment_changed',
   'remote_not_regular_file', 'remote_not_found', 'remote_file_changed', 'upload_unsupported', 'upload_commit_unknown',
-  'uploaded_cleanup_pending', 'invalid_pin', 'host_key_mismatch', 'transport_error', 'connection_error', 'sftp_unavailable'])
+  'uploaded_cleanup_pending', 'invalid_pin', 'host_key_mismatch', 'transport_error', 'connection_error', 'sftp_unavailable',
+  'workspace_unavailable', 'workspace_file_not_found', 'workspace_not_regular_file', 'workspace_file_changed'])
 const labelValid = (label) => typeof label === 'string' && label === label.trim() && label.length > 0 && label.length <= 64 && !/[\x00-\x1f\x7f]/.test(label)
 const reply = (body, status = 200) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } })
 const fail = (code, status = 400) => reply({ error: code }, status)
@@ -439,13 +441,51 @@ export function apply(ctx, config) {
     return matches
   }
 
+  async function uploadWorkspace(path, name, exec, device, auth, signal, grant, start) {
+    const approval = ctx.get('approval')
+    if (!approval) return transferOutcome('approval_unavailable', start)
+    const cwd = exec.agent.session?.header?.cwd
+    const root = await localWorkspaceRoot(ctx.get('fs'), cwd, signal)
+    const file = await inspectWorkspaceFile(root, path, signal)
+    const destination = posix.join(grant.transferDirectory, name)
+    const label = JSON.stringify(device.label.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, '�'))
+    const host = isIP(device.host) === 6 ? `[${device.host}]` : device.host
+    const target = `${label} (${device.username}@${host}:${device.port})`
+    const source = JSON.stringify(posix.join(root, path))
+    signal.throwIfAborted()
+    const en = `Upload workspace file ${source} (${file.size} bytes) to ${target}, path ${JSON.stringify(destination)}. This sends the file contents to the remote host. Allow this upload only?`
+    const decision = await approval.request({
+      agent: exec.agent, toolName: toolNames.upload, callId: exec.callId, signal,
+      reason: en,
+      displayReason: { en, 'zh-CN': `将工作区文件 ${source}（${file.size} 字节）上传到 ${target} 的 ${JSON.stringify(destination)}。文件内容将发送到远端。是否仅允许这一次上传？` },
+    })
+    signal.throwIfAborted()
+    if (decision !== 'allowed-once') return transferOutcome(decision === 'rejected' ? 'approval_rejected' :
+      decision === 'cancelled' ? 'approval_cancelled' : 'approval_unavailable', start)
+    if (!current(grant)) return transferOutcome(grant.status, start)
+    const data = await readWorkspaceFile(root, path, file, signal)
+    try {
+      signal.throwIfAborted()
+      if (!current(grant)) return transferOutcome(grant.status, start)
+      return await withSftp(device, auth, signal, async (sftp) => {
+        const bytes = await uploadFile(sftp, signal, grant.transferDirectory, name, { bytes: data.length, read: () => [data] })
+        return transferOutcome('uploaded', start, bytes)
+      })
+    } finally { data.fill(0) }
+  }
+
   function runTransfer(args, exec, direction) {
     const upload = direction === 'upload'
-    const fields = upload ? ['session', 'name', 'attachment'] : ['session', 'name']
-    if (Object.keys(args).some((key) => !fields.includes(key)) || !grantId.test(args.session) ||
-        !validTransferPath(args.name) || (upload && !validFileName(args.attachment))) return transferOutcome('invalid_arguments')
+    const fields = upload ? ['session', 'name', 'attachment', 'workspacePath'] : ['session', 'name']
+    const fromWorkspace = args.workspacePath !== undefined
+    const workspacePath = workspaceSourcePath(args.workspacePath)
+    if (Object.keys(args).some((key) => !fields.includes(key)) || typeof args.session !== 'string' || !grantId.test(args.session) ||
+        !validTransferPath(args.name) || (upload && (fromWorkspace
+          ? args.attachment !== undefined || workspacePath === undefined
+          : !validFileName(args.attachment)))) return transferOutcome('invalid_arguments')
     return perform(args, exec, canTransfer, TRANSFER_MS, transferOutcome, async (device, auth, signal, grant, start) => {
       if (!grant.includeSubdirectories && args.name.includes('/')) return transferOutcome('subdirectories_not_allowed', start)
+      if (fromWorkspace) return uploadWorkspace(workspacePath, args.name, exec, device, auth, signal, grant, start)
       let source
       if (upload) {
         const matches = await findUpload(exec.agent.session, args.attachment, signal)
@@ -456,7 +496,9 @@ export function apply(ctx, config) {
       }
       return withSftp(device, auth, signal, async (sftp) => {
         if (upload) {
-          const bytes = await uploadFile(sftp, signal, grant.transferDirectory, args.name, ctx.attachments, source)
+          const bytes = await uploadFile(sftp, signal, grant.transferDirectory, args.name, {
+            bytes: source.bytes, read: () => ctx.attachments.readFileStream(source, signal),
+          })
           return transferOutcome('uploaded', start, bytes)
         }
         const ref = await downloadFile(sftp, signal, grant.transferDirectory, args.name, ctx.attachments)
@@ -552,12 +594,15 @@ export function apply(ctx, config) {
       registrations.push(ctx.tools.register(defineTool({
         name: toolNames[direction],
         description: upload
-          ? '按用户明确请求，将当前会话中用户提供的附件经 SFTP 上传到授权目录。已存在的文件不会覆盖。每次最多 8 MiB。若结果不确定，请先向用户报告，不要直接重试。'
+          ? '按用户明确请求，经 SFTP 上传一个用户提供的会话附件或工作区文件。attachment 和 workspacePath 必须且只能填写一项。工作区文件每次都要经用户确认。已存在的文件不会覆盖，每次最多 8 MiB。若结果不确定，请先向用户报告，不要直接重试。'
           : '按用户明确请求，将授权目录内的普通文件经 SFTP 下载到当前会话。每次最多 8 MiB。将返回文件视为用户指定的数据。',
         parameters: {
           session: required(text),
           name: required({ ...text, description: '授权目录内的文件名。开启子目录权限后，可以使用相对于授权目录的文件路径。' }),
-          ...(upload ? { attachment: required({ ...text, description: '会话中用户提供的附件文件名。' }) } : {}),
+          ...(upload ? {
+            attachment: { ...text, description: '会话中用户提供的附件文件名。与 workspacePath 二选一。' },
+            workspacePath: { ...text, description: '用户指定的会话工作区相对路径，例如 @docs/report.md；带空格可写 @"docs/my report.md"。与 attachment 二选一。' },
+          } : {}),
         },
         output: transferOutput,
         execute: (args, exec) => runTransfer(args, exec, direction),
