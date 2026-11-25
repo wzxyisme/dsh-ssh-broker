@@ -477,18 +477,20 @@ export function apply(ctx, config) {
   function runTransfer(args, exec, direction) {
     const upload = direction === 'upload'
     const fields = upload ? ['session', 'name', 'attachment', 'workspacePath'] : ['session', 'name']
-    const fromWorkspace = args.workspacePath !== undefined
-    const workspacePath = workspaceSourcePath(args.workspacePath)
+    // 部分工具调用会把未填写的可选字符串序列化成空字符串。
+    const attachment = args.attachment === '' ? undefined : args.attachment
+    const fromWorkspace = args.workspacePath !== undefined && args.workspacePath !== ''
+    const workspacePath = fromWorkspace ? workspaceSourcePath(args.workspacePath) : undefined
     if (Object.keys(args).some((key) => !fields.includes(key)) || typeof args.session !== 'string' || !grantId.test(args.session) ||
         !validTransferPath(args.name) || (upload && (fromWorkspace
-          ? args.attachment !== undefined || workspacePath === undefined
-          : !validFileName(args.attachment)))) return transferOutcome('invalid_arguments')
+          ? attachment !== undefined || workspacePath === undefined
+          : !validFileName(attachment)))) return transferOutcome('invalid_arguments')
     return perform(args, exec, canTransfer, TRANSFER_MS, transferOutcome, async (device, auth, signal, grant, start) => {
       if (!grant.includeSubdirectories && args.name.includes('/')) return transferOutcome('subdirectories_not_allowed', start)
       if (fromWorkspace) return uploadWorkspace(workspacePath, args.name, exec, device, auth, signal, grant, start)
       let source
       if (upload) {
-        const matches = await findUpload(exec.agent.session, args.attachment, signal)
+        const matches = await findUpload(exec.agent.session, attachment, signal)
         signal.throwIfAborted()
         if (matches.size === 0) return transferOutcome('attachment_not_found', start)
         if (matches.size > 1) return transferOutcome('attachment_ambiguous', start)

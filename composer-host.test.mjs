@@ -363,7 +363,11 @@ test('SSH composer confines task admission to the live receiving session and sel
           assert.equal((await run('upload', upload, second)).status, 'not_authorized')
           assert.equal((await run('upload', { ...upload, name: 'reports/workspace.bin' })).status, 'subdirectories_not_allowed')
           assert.equal((await run('upload', { name: 'workspace.bin' })).status, 'invalid_arguments')
+          assert.equal((await run('upload', { ...upload, attachment: '', workspacePath: '' })).status, 'invalid_arguments')
           assert.equal((await run('upload', { ...upload, attachment: source.name })).status, 'invalid_arguments')
+          for (const attachment of [null, false, 0]) {
+            await assert.rejects(async () => run('upload', { ...upload, attachment }), { code: 'INVALID_ARGS' })
+          }
           for (const workspacePath of [local, `@${local}`, 'docs/../large.bin', 'C:/tmp/doc', '././large.bin', 'docs/', '']) {
             assert.equal((await run('upload', { ...upload, workspacePath })).status, 'invalid_arguments')
           }
@@ -428,13 +432,13 @@ test('SSH composer confines task admission to the live receiving session and sel
         assert.equal(result.attachment.name, 'summary.txt')
         assert.equal(downloaded.toString(), 'nested file')
         const upload = { name: 'reports/new.txt', attachment: source.name }
-        assert.equal((await run('upload', upload)).status, 'uploaded')
+        assert.equal((await run('upload', { ...upload, workspacePath: '' })).status, 'uploaded')
         assert.equal((await run('upload', upload)).status, 'remote_exists')
         assert.deepEqual(await readFile(join(reports, 'new.txt')), fixture)
         if (process.platform === 'linux') {
           const upload = { name: 'reports/workspace.bin', workspacePath: '@"docs/my report.bin"' }
           const previousApprovals = approvals.length
-          const uploaded = await run('upload', upload)
+          const uploaded = await run('upload', { ...upload, attachment: '' })
           assert.equal(uploaded.status, 'uploaded')
           assert.equal(uploaded.bytes, binary.length)
           assert.deepEqual(await readFile(join(reports, 'workspace.bin')), binary)
