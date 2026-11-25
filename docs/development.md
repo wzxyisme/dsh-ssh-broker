@@ -4,7 +4,7 @@
 
 ## 目录约定
 
-- `bundle/` 是唯一的可安装包根目录。保留包名 `@local/dsh-ssh-broker`、插件 ID `ssh-broker` 和 `dsh.bundle.patch`。DSH 官方模块由 Host 解析，不作为 npm 普通依赖重复打包。
+- `bundle/` 是唯一的插件包根目录。公开包名、插件条目 ID 和 Web 模块 ID 均为 `dsh-ssh-broker`。DSH 官方模块由 Host 解析，不作为 npm 普通依赖重复打包。
 - `tests/` 使用回环地址、临时目录和专用测试凭据。不要把真实 Profile、凭据库、终端日志或 SSH 密钥提交到 Git。
 - `docs/` 维护发布和市场提交说明。归档与校验和放在 Git 忽略的 `dist/`，通过 GitHub Release 分发，不提交到 Git。
 
@@ -28,17 +28,21 @@ node --test tests/*.test.mjs
 
 ## 打包与发布
 
-1. 更新 `bundle/package.json` 的版本、根目录双语 README 的安装链接和变更日志。审阅改动并跑完整回归。
-2. 从目标提交打包。在仓库根目录执行（以下以 `0.7.2` 为例）：
+1. 更新 `bundle/package.json` 的版本及变更日志，审阅改动并跑完整回归。用 npm 更新并提交包的锁文件。
+2. 在受审阅的提交上，从仓库根目录按锁文件生成发布归档（以下以 `0.7.3` 为例）：
 
    ```sh
-   mkdir -p dist
-   npm pack ./bundle --ignore-scripts --pack-destination dist
-   (cd dist && sha256sum local-dsh-ssh-broker-0.7.2.tgz > SHA256SUMS)
-   tar -tzf dist/local-dsh-ssh-broker-0.7.2.tgz
+   node scripts/pack-release.mjs
+   (cd dist && sha256sum -c SHA256SUMS)
+   tar -tzf dist/dsh-ssh-broker-0.7.3.tgz
    ```
 
-   检查包只包含运行文件、清单、资源、使用手册和许可证。依赖仍由包管理器按清单安装；tarball 不内嵌 `node_modules` 或本机环境。
-3. 用独立测试 Profile 运行 `dsh plugin --profile <test-profile> add <path-to-tgz> --ignore-scripts`。确认包名、版本、兼容性和 Host 插件配置可加载；不要用日常 Profile 代替隔离验证。
-4. 在已审阅的主分支提交上创建 `v<版本号>` Release，附上 `.tgz` 和 `SHA256SUMS`。从公开链接下载，再核对 SHA-256。保持资产名和 tag 中的版本一致。
-5. 市场采用固定 tag 的 Release URL。后续版本若要更新市场安装入口，只改自己的市场条目。详见[市场提交说明](market/README.md)。
+   脚本在临时目录运行 `npm ci --omit=optional --ignore-scripts`，保留 `ssh2` 的必需 JavaScript 依赖及许可证，剔除上游测试夹具。不要捆绑可选的 `cpu-features`、`nan` 或编译产物，也不要直接从源码目录发布。原生加速不是 SSH/SFTP 的运行前提。
+3. 在独立的 DSH Web Profile 中，用 `dsh plugin --profile <test-profile> add <path-to-tgz>` 试装，不加 `--ignore-scripts`。检查包名、版本、组合配置和 Host 回归。
+4. 在已登录并启用 2FA 的终端发布上一步验证过的**同一个归档**：
+
+   ```sh
+   npm publish ./dist/dsh-ssh-broker-0.7.3.tgz --access public --ignore-scripts --registry=https://registry.npmjs.org
+   ```
+
+   用干净的 Profile 验收 `dsh plugin --profile web add dsh-ssh-broker`，并核对公开 npm 的版本和包内容。若同步发布 GitHub Release，使用已验证归档和校验和，不要另打一个不同的包。市场条目使用固定的 Release URL，参见[市场提交说明](market/README.md)。

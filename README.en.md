@@ -16,14 +16,13 @@ Native desktop clients and non-Linux hosts have not been verified. Workspace-fil
 
 ## Install or upgrade
 
-Download `local-dsh-ssh-broker-0.7.2.tgz` and `SHA256SUMS` from [GitHub Release v0.7.2](https://github.com/wzxyisme/dsh-ssh-broker/releases/tag/v0.7.2). Run these commands from the download directory:
-
 ```sh
-sha256sum -c SHA256SUMS
-dsh plugin --profile web add ./local-dsh-ssh-broker-0.7.2.tgz --ignore-scripts
+dsh plugin --profile web add dsh-ssh-broker
 ```
 
-Replace `web` if you use a different Web profile. You do not need to uninstall the old version first. Restart the corresponding DSH service, then open **Settings → SSH devices**. You do not need to run native dependency build scripts. Do not bypass the compatibility check on unverified DSH versions.
+Replace `web` if you use a different Web profile. Restart the corresponding DSH service, then open **Settings → SSH devices**. The package bundles the pure JavaScript SSH dependencies; there are no native build scripts to approve. Do not bypass the compatibility check on unverified DSH versions.
+
+**If you installed a test package at 0.7.2 or earlier:** The new package and plugin entry are both named `dsh-ssh-broker`. The new plugin neither reads nor deletes the old vault. To keep your devices, export an encrypted backup before removing the old package with `dsh plugin --profile web remove @local/dsh-ssh-broker`, then install the new one. After restart, you can restore the backup into the empty vault and reverify each device's host key. Do not install both versions in the same profile.
 
 ## Quick start
 

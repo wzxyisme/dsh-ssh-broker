@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/dsh-ssh-broker',
+  id: 'dsh-ssh-broker',
   factory(require) {
     const { createElement: h, Fragment: ReactFragment, useEffect, useRef, useState } = require('react')
     const ns = 'ssh-broker-settings'
